@@ -119,9 +119,10 @@ IFS='|' read -r PROD_DB_NAME PROD_DB_USER <<< "$PROD_DB_INFO"
 read -p "Enter staging domain (e.g., stg.example.com): " STG_DOMAIN
 if [[ -z "$STG_DOMAIN" ]]; then echo "[ERROR] Domain required."; exit 1; fi
 
-# Generate safe, short alphanumeric names guaranteed to pass CloudPanel validation
-CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | sed 's/[^a-zA-Z0-9]//g' | cut -c1-8)
-STG_USER="stg${CLEAN_DOMAIN}"
+# Generate safe, pure lowercase alphanumeric names to guarantee passing CloudPanel validation
+CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-6)
+RND_STR=$(openssl rand -hex 2) # 4 random hex chars for guaranteed uniqueness
+STG_USER="stg${CLEAN_DOMAIN}${RND_STR}"
 STG_PASS=$(openssl rand -hex 16)
 
 # 4. Provision Site & Database
@@ -129,8 +130,9 @@ echo -e "\n[+] Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION..."
 clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS"
 
 if [[ -n "$PROD_DB_NAME" ]]; then
-    STG_DB_NAME="${STG_USER}_db"
-    STG_DB_USER="${STG_USER}_usr"
+    # Create valid alphanumeric database names matching CloudPanel standards
+    STG_DB_NAME="db${CLEAN_DOMAIN}${RND_STR}"
+    STG_DB_USER="u${CLEAN_DOMAIN}${RND_STR}"
     STG_DB_PASS=$(openssl rand -hex 16)
 
     echo "[+] Exporting production database ($PROD_DB_NAME)..."
