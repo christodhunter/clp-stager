@@ -165,6 +165,14 @@ if [[ -n "$PROD_DB_NAME" ]]; then
         sed -i "s/define( *'DB_NAME', *'[^']*' *);/define('DB_NAME', '$STG_DB_NAME');/g" "$DEST_DIR/wp-config.php"
         sed -i "s/define( *'DB_USER', *'[^']*' *);/define('DB_USER', '$STG_DB_USER');/g" "$DEST_DIR/wp-config.php"
         sed -i "s/define( *'DB_PASSWORD', *'[^']*' *);/define('DB_PASSWORD', '$STG_DB_PASS');/g" "$DEST_DIR/wp-config.php"
+        
+        # Prevent WordPress from redirecting back to the production site
+        if grep -q "WP_HOME" "$DEST_DIR/wp-config.php"; then
+            sed -i "s|define( *'WP_HOME', *'[^']*' *);|define('WP_HOME', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
+            sed -i "s|define( *'WP_SITEURL', *'[^']*' *);|define('WP_SITEURL', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
+        else
+            sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$STG_DOMAIN');\ndefine('WP_SITEURL', 'https://$STG_DOMAIN');" "$DEST_DIR/wp-config.php"
+        fi
     elif [[ -f "$DEST_DIR/.env" ]]; then
         sed -i "s/DB_DATABASE=.*/DB_DATABASE=$STG_DB_NAME/g" "$DEST_DIR/.env"
         sed -i "s/DB_USERNAME=.*/DB_USERNAME=$STG_DB_USER/g" "$DEST_DIR/.env"
@@ -175,12 +183,15 @@ fi
 echo -e "\n========================================================"
 echo -e "✅ \e[32mStaging Deployment Complete!\e[0m"
 echo "Staging Domain:  $STG_DOMAIN"
-echo "Site/SSH User:   $STG_USER"
-echo "Site Password:   $STG_PASS"
+echo "SSH/SFTP User:   $STG_USER"
+echo "SSH/SFTP Pass:   $STG_PASS"
 if [[ -n "$PROD_DB_NAME" ]]; then
 echo "Database Name:   $STG_DB_NAME"
 echo "Database User:   $STG_DB_USER"
 echo "Database Pass:   $STG_DB_PASS"
+if [[ -f "$DEST_DIR/wp-config.php" ]]; then
+echo -e "\n=> WP Admin Login: Use the SAME username and password as your live site!"
+fi
 fi
 echo "========================================================"
 
