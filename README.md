@@ -22,23 +22,23 @@ You don't need to clone this entire repo to your server. You can create and run 
 
 SSH into your CloudPanel server as the `root` user:
 
-```
+```bash
 ssh root@your-server-ip
 
 ```
 
 ### Step 2: Create the script file
 
-Open the `nano` text editor to create the script file:
+Open the `nano` text editor to create the script file and automatically make it executable when you save and exit:
 
-```
-nano /root/make-staging.sh
+```bash
+nano /root/make-staging.sh && chmod +x /root/make-staging.sh
 
 ```
 
 ### Step 3: Paste the Script
 
-Copy the code below and paste it into the `nano` editor:
+Copy the code below, paste it into the `nano` editor, save (CTRL+O, Enter), and exit (CTRL+X):
 
 <details>
 <summary><strong>Click to expand the Bash Script</strong></summary>
@@ -86,13 +86,21 @@ choose_site() {
             else
                 echo -e "   $o"
             fi
-            ((index++))
+            index=$((index + 1))
         done
         
-        read -s -n3 key 
-        if [[ $key == $esc[A ]]; then cur=$((cur - 1)); [ $cur -lt 0 ] && cur=$((count - 1))
-        elif [[ $key == $esc[B ]]; then cur=$((cur + 1)); [ $cur -ge $count ] && cur=0
-        elif [[ -z $key ]]; then break; fi
+        # Capture input and prevent set -e from killing the script
+        read -s -n3 key || true
+        
+        if [[ $key == $esc[A ]]; then 
+            cur=$((cur - 1))
+            if [ $cur -lt 0 ]; then cur=$((count - 1)); fi
+        elif [[ $key == $esc[B ]]; then 
+            cur=$((cur + 1))
+            if [ $cur -ge $count ]; then cur=0; fi
+        elif [[ -z $key ]]; then 
+            break
+        fi
         echo -en "\e[${count}A"
     done
     eval $outvar="${options[$cur]}"
@@ -176,24 +184,12 @@ echo "========================================================"
 
 </details>
 
-### Step 4: Save, Exit, and Make Executable
 
-* In `nano`, press `CTRL + O` to save, then `Enter` to confirm.
-
-* Press `CTRL + X` to exit.
-
-* Make the script executable by running:
-
-  ```
-  chmod +x /root/make-staging.sh
-  
-  ```
-
-### Step 5: Run the Script
+### Step 4: Run the Script
 
 Whenever you want to spin up a staging site, simply run:
 
-```
+```bash
 /root/make-staging.sh
 
 ```
