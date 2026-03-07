@@ -119,26 +119,28 @@ IFS='|' read -r PROD_DB_NAME PROD_DB_USER <<< "$PROD_DB_INFO"
 read -p "Enter staging domain (e.g., stg.example.com): " STG_DOMAIN
 if [[ -z "$STG_DOMAIN" ]]; then echo "[ERROR] Domain required."; exit 1; fi
 
-STG_USER=$(echo "$STG_DOMAIN" | sed 's/[^a-zA-Z0-9]//g' | cut -c1-12)"stg"
-STG_PASS=$(openssl rand -base64 16)
+# Generate safe, short alphanumeric names guaranteed to pass CloudPanel validation
+CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | sed 's/[^a-zA-Z0-9]//g' | cut -c1-8)
+STG_USER="stg${CLEAN_DOMAIN}"
+STG_PASS=$(openssl rand -hex 16)
 
 # 4. Provision Site & Database
 echo -e "\n[+] Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION..."
-clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS" > /dev/null
+clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS"
 
 if [[ -n "$PROD_DB_NAME" ]]; then
     STG_DB_NAME="${STG_USER}_db"
     STG_DB_USER="${STG_USER}_usr"
-    STG_DB_PASS=$(openssl rand -base64 16)
+    STG_DB_PASS=$(openssl rand -hex 16)
 
     echo "[+] Exporting production database ($PROD_DB_NAME)..."
-    clpctl db:export --databaseName="$PROD_DB_NAME" --file="/tmp/${PROD_DB_NAME}.sql.gz" > /dev/null
+    clpctl db:export --databaseName="$PROD_DB_NAME" --file="/tmp/${PROD_DB_NAME}.sql.gz"
 
     echo "[+] Creating staging database ($STG_DB_NAME)..."
-    clpctl db:add --domainName="$STG_DOMAIN" --databaseName="$STG_DB_NAME" --databaseUserName="$STG_DB_USER" --databaseUserPassword="$STG_DB_PASS" > /dev/null
+    clpctl db:add --domainName="$STG_DOMAIN" --databaseName="$STG_DB_NAME" --databaseUserName="$STG_DB_USER" --databaseUserPassword="$STG_DB_PASS"
 
     echo "[+] Importing data into staging database..."
-    clpctl db:import --databaseName="$STG_DB_NAME" --file="/tmp/${PROD_DB_NAME}.sql.gz" > /dev/null
+    clpctl db:import --databaseName="$STG_DB_NAME" --file="/tmp/${PROD_DB_NAME}.sql.gz"
     rm -f "/tmp/${PROD_DB_NAME}.sql.gz"
 fi
 
