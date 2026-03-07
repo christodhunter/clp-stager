@@ -29,14 +29,12 @@ ssh root@your-server-ip
 
 ### Step 2: Create the script file
 
-Open the `nano` text editor to create the script file and automatically make it executable when you save and exit:
+Open the `nano` text editor to create the file:
 
 ```bash
 nano /root/make-staging.sh && chmod +x /root/make-staging.sh
 
 ```
-
-### Step 3: Paste the Script
 
 Copy the code below, paste it into the `nano` editor, save (CTRL+O, Enter), and exit (CTRL+X):
 
@@ -200,7 +198,7 @@ echo "========================================================"
 </details>
 
 
-### Step 4: Run the Script
+### Step 3: Run the Script
 
 Whenever you want to spin up a staging site, simply run:
 
