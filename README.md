@@ -38,7 +38,7 @@ nano /root/make-staging.sh && chmod +x /root/make-staging.sh
 
 ```
 
-Copy the code below, paste it into the `nano` editor, save (CTRL+O, Enter), and exit (CTRL+X):
+Copy the code below, paste it into the `nano` editor, save (CTRL+S), and exit (CTRL+X):
 
 <details>
 <summary><strong>Click to expand the Bash Script</strong></summary>
