@@ -45,7 +45,7 @@ Copy the code below, paste it into the `nano` editor, save (CTRL+S), and exit (C
 
 ```bash
 #!/usr/bin/env bash
-# clp-stager: CloudPanel Staging Site Generator (Multisite SAN SSL, Progress Tracking & Auto-Cleanup)
+# clp-stager: CloudPanel Staging Site Generator (Multisite SAN SSL, Progress Spinners & Auto-Cleanup)
 
 set -e
 DB_PATH="/home/clp/htdocs/app/data/db.sq3"
@@ -68,11 +68,17 @@ STG_DB_CREATED=false
 STG_DOMAIN=""
 STG_DB_NAME=""
 PROD_DB_NAME=""
+CURRENT_PID=""
 
 cleanup_on_error() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        echo -e "\n\e[31m[!] ERROR ENCOUNTERED (Exit code $exit_code). INITIATING ROLLBACK...\e[0m"
+        echo -e "\n\e[31m[!] ERROR ENCOUNTERED. INITIATING ROLLBACK...\e[0m"
+        
+        # Kill any hanging background tasks
+        if [[ -n "$CURRENT_PID" ]] && kill -0 $CURRENT_PID 2>/dev/null; then
+            kill -9 $CURRENT_PID 2>/dev/null || true
+        fi
         
         if [[ -n "$PROD_DB_NAME" && -f "/tmp/${PROD_DB_NAME}.sql.gz" ]]; then
             echo "    -> Removing dangling database export..."
@@ -98,8 +104,57 @@ cleanup_on_error() {
     fi
     exit $exit_code
 }
-# Trap catches ERR and EXIT. If it exits with non-zero, the rollback triggers.
-trap cleanup_on_error EXIT
+trap cleanup_on_error EXIT INT TERM
+
+# ==========================================
+# SPINNER EXECUTOR FUNCTION
+# ==========================================
+execute_with_spinner() {
+    local msg="$1"
+    local cmd="$2"
+    local allow_fail="$3"
+    local log_file="/tmp/clp_stager_step.log"
+    
+    bash -c "$cmd" > "$log_file" 2>&1 &
+    CURRENT_PID=$!
+    
+    local spinstr='|/-\'
+    while kill -0 $CURRENT_PID 2>/dev/null; do
+        local temp=${spinstr#?}
+        printf "\r\e[36m[%c]\e[0m %s" "$spinstr" "$msg"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep 0.1
+    done
+    
+    set +e # Temporarily disable auto-exit so we can process the error correctly
+    wait $CURRENT_PID
+    local exit_code=$?
+    set -e
+    CURRENT_PID=""
+    
+    printf "\r\033[K" # Clear spinner line
+    
+    if [ $exit_code -eq 0 ]; then
+        if grep -qi "invalid command\|error\|exception" "$log_file"; then
+            printf "\e[31m[x]\e[0m %s\n" "$msg"
+            echo -e "\e[31m--- ERROR DETAILS ---\e[0m"
+            cat "$log_file"
+            echo -e "\e[31m---------------------\e[0m"
+            exit 1
+        fi
+        printf "\e[32m[✓]\e[0m %s\n" "$msg"
+    else
+        if [ "$allow_fail" == "true" ]; then
+            printf "\e[33m[!]\e[0m %s (Finished with warnings)\n" "$msg"
+        else
+            printf "\e[31m[x]\e[0m %s\n" "$msg"
+            echo -e "\e[31m--- ERROR DETAILS ---\e[0m"
+            cat "$log_file"
+            echo -e "\e[31m---------------------\e[0m"
+            exit $exit_code
+        fi
+    fi
+}
 
 # ==========================================
 # 1. Fetch Active PHP Sites
@@ -135,16 +190,9 @@ choose_site() {
         done
         
         read -s -n3 key || true
-        
-        if [[ $key == $esc[A ]]; then 
-            cur=$((cur - 1))
-            if [ $cur -lt 0 ]; then cur=$((count - 1)); fi
-        elif [[ $key == $esc[B ]]; then 
-            cur=$((cur + 1))
-            if [ $cur -ge $count ]; then cur=0; fi
-        elif [[ -z $key ]]; then 
-            break
-        fi
+        if [[ $key == $esc[A ]]; then cur=$((cur - 1)); [ $cur -lt 0 ] && cur=$((count - 1));
+        elif [[ $key == $esc[B ]]; then cur=$((cur + 1)); [ $cur -ge $count ] && cur=0;
+        elif [[ -z $key ]]; then break; fi
         echo -en "\e[${count}A"
     done
     eval $outvar="${options[$cur]}"
@@ -154,23 +202,16 @@ choose_site
 echo -e "\nSelected Production Site: \e[32m$PROD_DOMAIN\e[0m\n"
 
 # ==========================================
-# 3. Get Details & Prompts (Safely)
+# 3. Get Details & Prompts (Sanitized)
 # ==========================================
-# Fetching properties separately ensures no variable shifting if a column is NULL
-SRC_USER=$(sqlite3 "$DB_PATH" "SELECT user FROM site WHERE domain_name = '$PROD_DOMAIN';")
-PHP_VERSION=$(sqlite3 "$DB_PATH" "SELECT php_version FROM php_settings WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN');")
-VHOST_TEMPLATE=$(sqlite3 "$DB_PATH" "SELECT vhost_template FROM site WHERE domain_name = '$PROD_DOMAIN';" 2>/dev/null || true)
+SRC_USER=$(sqlite3 "$DB_PATH" "SELECT user FROM site WHERE domain_name = '$PROD_DOMAIN' LIMIT 1;" | tr -d '\r\n')
+PHP_VERSION=$(sqlite3 "$DB_PATH" "SELECT php_version FROM php_settings WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;" | tr -d '\r\n')
+PROD_DB_NAME=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;" | tr -d '\r\n')
 
-# Failsafes
 if [[ -z "$PHP_VERSION" ]]; then
     echo -e "\e[31m[ERROR] Could not determine PHP Version for $PROD_DOMAIN. Aborting.\e[0m"
     exit 1
 fi
-if [[ -z "$VHOST_TEMPLATE" ]]; then
-    VHOST_TEMPLATE="Generic"
-fi
-
-PROD_DB_NAME=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;")
 
 read -p "Enter staging domain (e.g., stg.example.com): " STG_DOMAIN
 if [[ -z "$STG_DOMAIN" ]]; then echo "[ERROR] Domain required."; exit 1; fi
@@ -178,13 +219,17 @@ if [[ -z "$STG_DOMAIN" ]]; then echo "[ERROR] Domain required."; exit 1; fi
 CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-6)
 RND_STR=$(openssl rand -hex 2)
 STG_USER="stg${CLEAN_DOMAIN}${RND_STR}"
-STG_PASS=$(openssl rand -hex 16)
+# Ensure CloudPanel's password complexity rules are met
+STG_PASS="Stg1!$(openssl rand -hex 6)"
+
+echo ""
 
 # ==========================================
 # 4. Provision Site
 # ==========================================
-echo -e "\n\e[36m[Step 1/8]\e[0m Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION..."
-clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="$VHOST_TEMPLATE" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS"
+# We use Generic since Step 8 completely overrides the config with the production vHost anyway
+CMD="clpctl site:add:php --domainName=\"$STG_DOMAIN\" --phpVersion=\"$PHP_VERSION\" --vhostTemplate=\"Generic\" --siteUser=\"$STG_USER\" --siteUserPassword=\"$STG_PASS\""
+execute_with_spinner "Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION..." "$CMD"
 STG_DOMAIN_CREATED=true
 
 # ==========================================
@@ -195,18 +240,12 @@ if [[ -n "$PROD_DB_NAME" ]]; then
     STG_DB_USER="u${CLEAN_DOMAIN}${RND_STR}"
     STG_DB_PASS=$(openssl rand -hex 16)
 
-    echo -e "\e[36m[Step 2/8]\e[0m Exporting production database ($PROD_DB_NAME)..."
-    clpctl db:export --databaseName="$PROD_DB_NAME" --file="/tmp/${PROD_DB_NAME}.sql.gz"
-
-    echo -e "\e[36m[Step 3/8]\e[0m Creating staging database ($STG_DB_NAME)..."
-    clpctl db:add --domainName="$STG_DOMAIN" --databaseName="$STG_DB_NAME" --databaseUserName="$STG_DB_USER" --databaseUserPassword="$STG_DB_PASS"
+    execute_with_spinner "Exporting production database ($PROD_DB_NAME) [This may take a while]..." "clpctl db:export --databaseName=\"$PROD_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\""
+    execute_with_spinner "Creating staging database ($STG_DB_NAME)..." "clpctl db:add --domainName=\"$STG_DOMAIN\" --databaseName=\"$STG_DB_NAME\" --databaseUserName=\"$STG_DB_USER\" --databaseUserPassword=\"$STG_DB_PASS\""
     STG_DB_CREATED=true
-
-    echo -e "\e[36m[Step 4/8]\e[0m Importing data into staging database..."
-    clpctl db:import --databaseName="$STG_DB_NAME" --file="/tmp/${PROD_DB_NAME}.sql.gz"
+    
+    execute_with_spinner "Importing data into staging database [This may take a while]..." "clpctl db:import --databaseName=\"$STG_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\""
     rm -f "/tmp/${PROD_DB_NAME}.sql.gz"
-else
-    echo -e "\e[36m[Step 2-4/8]\e[0m No database found for $PROD_DOMAIN. Skipping DB setup..."
 fi
 
 # ==========================================
@@ -215,18 +254,13 @@ fi
 SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
 DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
 
-echo -e "\e[36m[Step 5/8]\e[0m Cloning files via tar..."
-tar -cf "/tmp/stg_backup.tar" -C "$SRC_DIR" .
-mv "/tmp/stg_backup.tar" "$DEST_DIR/"
-cd "$DEST_DIR"
-tar -xf "stg_backup.tar"
-rm "stg_backup.tar"
-chown -R "$STG_USER:$STG_USER" "$DEST_DIR"
+execute_with_spinner "Packaging production files (tar)..." "tar -cf \"/tmp/stg_backup.tar\" -C \"$SRC_DIR\" ."
+execute_with_spinner "Extracting and applying permissions to staging files..." "mv \"/tmp/stg_backup.tar\" \"$DEST_DIR/\" && cd \"$DEST_DIR\" && tar -xf \"stg_backup.tar\" && rm \"stg_backup.tar\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
 
 # ==========================================
 # 7. Config Updates & WP-CLI Search/Replace
 # ==========================================
-echo -e "\e[36m[Step 6/8]\e[0m Updating config files and databases..."
+echo -e "\e[32m[✓]\e[0m Updating environment config files..."
 if [[ -n "$PROD_DB_NAME" ]]; then
     if [[ -f "$DEST_DIR/wp-config.php" ]]; then
         sed -i "s/define( *'DB_NAME', *'[^']*' *);/define('DB_NAME', '$STG_DB_NAME');/g" "$DEST_DIR/wp-config.php"
@@ -240,14 +274,10 @@ if [[ -n "$PROD_DB_NAME" ]]; then
             sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$STG_DOMAIN');\ndefine('WP_SITEURL', 'https://$STG_DOMAIN');" "$DEST_DIR/wp-config.php"
         fi
 
-        # Multisite Detection
         if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
-            echo "    -> WordPress Multisite detected! Updating network configuration..."
             sed -i "s/define( *'DOMAIN_CURRENT_SITE', *'[^']*' *);/define('DOMAIN_CURRENT_SITE', '$STG_DOMAIN');/g" "$DEST_DIR/wp-config.php"
-            echo "    -> Running WP-CLI search-replace across all subsites..."
-            sudo -u "$STG_USER" wp search-replace "$PROD_DOMAIN" "$STG_DOMAIN" --network --path="$DEST_DIR" || echo "    -> [WARNING] WP-CLI search-replace encountered an issue."
+            execute_with_spinner "Multisite Detected: Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"$PROD_DOMAIN\" \"$STG_DOMAIN\" --network --path=\"$DEST_DIR\"" "true"
         fi
-
     elif [[ -f "$DEST_DIR/.env" ]]; then
         sed -i "s/DB_DATABASE=.*/DB_DATABASE=$STG_DB_NAME/g" "$DEST_DIR/.env"
         sed -i "s/DB_USERNAME=.*/DB_USERNAME=$STG_DB_USER/g" "$DEST_DIR/.env"
@@ -258,42 +288,30 @@ fi
 # ==========================================
 # 8. Clone Custom vHost Edits
 # ==========================================
-echo -e "\e[36m[Step 7/8]\e[0m Cloning custom Nginx configurations..."
 PROD_VHOST="/etc/nginx/sites-enabled/$PROD_DOMAIN.conf"
 STG_VHOST="/etc/nginx/sites-enabled/$STG_DOMAIN.conf"
-
-if [[ ! -f "$PROD_VHOST" ]]; then
-    PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf"
-    STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
-fi
+[[ ! -f "$PROD_VHOST" ]] && PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf" && STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
 
 if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
-    sed -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" \
-        -e "s/$SRC_USER/$STG_USER/g" \
-        "$PROD_VHOST" > "$STG_VHOST"
-        
+    sed -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" -e "s/$SRC_USER/$STG_USER/g" "$PROD_VHOST" > "$STG_VHOST"
     if nginx -t >/dev/null 2>&1; then
         systemctl reload nginx
-        echo "    -> Custom vHost settings copied successfully."
+        echo -e "\e[32m[✓]\e[0m Custom vHost settings copied successfully."
     else
-        echo "    -> [WARNING] Copied vHost caused an Nginx error. Reverting to default template."
-        clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="$VHOST_TEMPLATE" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS" >/dev/null 2>&1 || true
+        clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS" >/dev/null 2>&1 || true
         systemctl reload nginx
+        echo -e "\e[33m[!]\e[0m Copied vHost failed Nginx tests. Reverted to default template safely."
     fi
 fi
 
 # ==========================================
 # 9. Multisite DNS Check & SSL Issuance
 # ==========================================
-echo -e "\n\e[36m[Step 8/8]\e[0m Preparing SSL Configuration..."
-
 SAN_LIST=""
 DISPLAY_DOMAINS="$STG_DOMAIN"
 
 if sudo -u "$STG_USER" wp core is-installed --network --path="$DEST_DIR" 2>/dev/null; then
-    echo "    -> Analyzing Multisite network for subdomains..."
     SUBS=$(sudo -u "$STG_USER" wp site list --field=domain --path="$DEST_DIR" 2>/dev/null | tr -d '\r' | grep -v "^$STG_DOMAIN$" || true)
-    
     if [[ -n "$SUBS" ]]; then
         SAN_LIST=$(echo "$SUBS" | paste -sd "," -)
         DISPLAY_DOMAINS="$STG_DOMAIN, $(echo "$SUBS" | paste -sd ", " -)"
@@ -308,21 +326,22 @@ echo -e "\n   \e[36m$DISPLAY_DOMAINS\e[0m\n"
 echo -e "If you use Cloudflare, ensure the proxy status is temporarily 'DNS Only'."
 echo -e "----------------------------------------------------------------------"
 
-# Disable the error trap temporarily during user input so Ctrl+C cancels nicely without throwing ugly rollback logic if they haven't finished the prompt
-trap - EXIT 
+trap - EXIT INT TERM 
 
 read -p "Have you pointed the DNS records and want to issue the SSL? (y/n): " ISSUE_SSL
 
 if [[ "$ISSUE_SSL" =~ ^[Yy]$ ]]; then
-    echo -e "\n[+] Issuing Let's Encrypt SSL Certificate..."
+    trap cleanup_on_error EXIT INT TERM
     if [[ -n "$SAN_LIST" ]]; then
-        clpctl lets-encrypt:install:certificate --domainName="$STG_DOMAIN" --subjectAlternativeName="$SAN_LIST" || echo "    -> [WARNING] SSL Issuance failed. Ensure DNS for ALL subdomains points to this server."
+        execute_with_spinner "Issuing Let's Encrypt SAN SSL Certificate..." "clpctl lets-encrypt:install:certificate --domainName=\"$STG_DOMAIN\" --subjectAlternativeName=\"$SAN_LIST\"" "true"
     else
-        clpctl lets-encrypt:install:certificate --domainName="$STG_DOMAIN" || echo "    -> [WARNING] SSL Issuance failed. Check your DNS records."
+        execute_with_spinner "Issuing Let's Encrypt SSL Certificate..." "clpctl lets-encrypt:install:certificate --domainName=\"$STG_DOMAIN\"" "true"
     fi
 else
     echo -e "\n[i] Skipping SSL certificate issuance. You can do this later via CloudPanel."
 fi
+
+trap - EXIT INT TERM 
 
 echo -e "\n========================================================"
 echo -e "✅ \e[32mStaging Deployment Complete!\e[0m"
