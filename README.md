@@ -46,7 +46,7 @@ Copy the code below, paste it into the `nano` editor, save (CTRL+S), and exit (C
 ```bash
 #!/usr/bin/env bash
 # clp-stager: High-Performance Staging Generator for CloudPanel
-# Features: Piped Sync, Parallel Execution, Bulletproof Multisite, vHost Cloning, Auto-Cleanup
+# Features: Sequential Sync, Hardware-Aware ETA, Bulletproof Multisite, vHost Cloning, Auto-Cleanup
 
 set -e
 DB_PATH="/home/clp/htdocs/app/data/db.sq3"
@@ -62,16 +62,74 @@ if ! command -v sqlite3 &> /dev/null; then
 fi
 
 # ==========================================
-# PERFORMANCE & TIME HELPERS
+# PERFORMANCE & HARDWARE HELPERS
 # ==========================================
+get_disk_speed() {
+    local target_dir=$1
+    local speed=150 # Default to standard SATA SSD (150 MB/s)
+    
+    # Find the block device where this directory lives
+    local device=$(df "$target_dir" | tail -n 1 | awk '{print $1}')
+    
+    # Check if rotational (1 = HDD, 0 = SSD/NVMe)
+    local is_hdd=0
+    if command -v lsblk &> /dev/null; then
+        is_hdd=$(lsblk -no ROTA "$device" 2>/dev/null | head -n 1 | tr -d ' ')
+    fi
+    
+    if [[ "$is_hdd" == "1" ]]; then
+        speed=50  # Slow HDD
+    elif [[ "$is_hdd" == "0" ]]; then
+        if [[ "$device" == *"nvme"* ]]; then
+            speed=300 # Fast NVMe
+        else
+            speed=150 # Standard SSD
+        fi
+    fi
+    echo "$speed"
+}
+
 get_size_estimate() {
     local dir=$1
     if [ -d "$dir" ]; then
+        local speed=$(get_disk_speed "$dir")
         local size_mb=$(du -sm "$dir" | cut -f1)
-        # Tuned for modern local NVMe/SSD speeds (~150 MB/s)
-        local eta=$(( size_mb / 150 ))
+        
+        local eta=$(( size_mb / speed ))
         [[ $eta -lt 1 ]] && eta=1
-        echo "$size_mb MB (~$eta seconds)"
+        
+        local drive_type="SSD"
+        [[ "$speed" == 50 ]] && drive_type="HDD"
+        [[ "$speed" == 300 ]] && drive_type="NVMe"
+        
+        echo "$size_mb MB (~$eta seconds on $drive_type)"
+    else
+        echo "0 MB"
+    fi
+}
+
+get_db_estimate() {
+    local db_name=$1
+    if [[ -n "$db_name" ]]; then
+        # Fetch and trim CloudPanel's master DB password dynamically
+        local db_root_pass=$(clpctl db:show:master-credentials | grep 'Password' | awk -F'|' '{print $3}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        
+        # Query MySQL for combined table sizes in MB using the master credentials
+        local size_mb=$(mysql -h 127.0.0.1 -u root -p"$db_root_pass" -Bse "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 0) FROM information_schema.tables WHERE table_schema = '$db_name';" 2>/dev/null)
+        
+        if [[ -n "$size_mb" && "$size_mb" != "NULL" && "$size_mb" -gt 0 ]]; then
+            local speed=$(get_disk_speed "/var/lib/mysql")
+            # DB exports/imports are CPU/SQL bound, so we estimate they process at half the raw disk speed
+            local dump_speed=$(( speed / 2 ))
+            [[ $dump_speed -lt 10 ]] && dump_speed=10
+            
+            local eta=$(( size_mb / dump_speed ))
+            [[ $eta -lt 1 ]] && eta=1
+            
+            echo "$size_mb MB (~$eta seconds)"
+        else
+            echo "Unknown Size"
+        fi
     else
         echo "0 MB"
     fi
@@ -95,6 +153,7 @@ cleanup_on_error() {
         echo -e "\n\e[31m[!] ERROR ENCOUNTERED. INITIATING ROLLBACK...\e[0m"
         
         if [[ -n "$CURRENT_PID" ]] && kill -0 $CURRENT_PID 2>/dev/null; then
+            pkill -P $CURRENT_PID 2>/dev/null || true # Kill child processes (like tar)
             kill -9 $CURRENT_PID 2>/dev/null || true
         fi
         
@@ -109,9 +168,6 @@ cleanup_on_error() {
         if [ "$STG_DOMAIN_CREATED" = true ] && [[ -n "$STG_DOMAIN" ]]; then
             clpctl site:delete --domainName="$STG_DOMAIN" >/dev/null 2>&1 || true
         fi
-        
-        # Clean up parallel execution script if it was interrupted
-        rm -f /tmp/clp_parallel_mig.sh
         
         echo -e "\e[32m[✓] Cleanup complete. Your server is clean.\e[0m"
     fi
@@ -259,53 +315,40 @@ execute_with_spinner "Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION
 STG_DOMAIN_CREATED=true
 
 # ==========================================
-# 5 & 6. Parallel Migration (Files & Database)
+# 5. Database Migration
 # ==========================================
-SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
-DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
-
-ESTIMATE=$(get_size_estimate "$SRC_DIR")
-echo -e "\e[34m[i]\e[0m Migration Volume: $ESTIMATE"
-
 if [[ -n "$PROD_DB_NAME" ]]; then
     STG_DB_NAME="db${CLEAN_DOMAIN}${RND_STR}"
     STG_DB_USER="u${CLEAN_DOMAIN}${RND_STR}"
     STG_DB_PASS=$(openssl rand -hex 16)
     STG_DB_CREATED=true
 
+    DB_ESTIMATE=$(get_db_estimate "$PROD_DB_NAME")
+    echo -e "\e[34m[i]\e[0m Database Volume: $DB_ESTIMATE"
+
     # Build DB Migration Command Sequence
-    DB_CMD="clpctl db:export --databaseName=\"$PROD_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && clpctl db:add --domainName=\"$STG_DOMAIN\" --databaseName=\"$STG_DB_NAME\" --databaseUserName=\"$STG_DB_USER\" --databaseUserPassword=\"$STG_DB_PASS\" && clpctl db:import --databaseName=\"$STG_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && rm -f \"/tmp/${PROD_DB_NAME}.sql.gz\""
+    DB_CMD="clpctl db:export --databaseName=\"$PROD_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && \
+            clpctl db:add --domainName=\"$STG_DOMAIN\" --databaseName=\"$STG_DB_NAME\" --databaseUserName=\"$STG_DB_USER\" --databaseUserPassword=\"$STG_DB_PASS\" && \
+            clpctl db:import --databaseName=\"$STG_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && \
+            rm -f \"/tmp/${PROD_DB_NAME}.sql.gz\""
+            
+    execute_with_spinner "Migrating Database ($PROD_DB_NAME -> $STG_DB_NAME)..." "$DB_CMD"
 else
-    DB_CMD="true"
+    echo -e "\e[34m[i]\e[0m No production database found. Skipping DB migration."
 fi
+
+# ==========================================
+# 6. File Migration
+# ==========================================
+SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
+DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
+
+FILE_ESTIMATE=$(get_size_estimate "$SRC_DIR")
+echo -e "\e[34m[i]\e[0m File Volume: $FILE_ESTIMATE"
 
 FILE_CMD="tar -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
 
-# Safely wrap both sequences into a background execution script
-cat << EOF > /tmp/clp_parallel_mig.sh
-#!/bin/bash
-(
-    $DB_CMD
-) &
-PID1=\$!
-
-(
-    $FILE_CMD
-) &
-PID2=\$!
-
-# Wait for both processes to complete and capture their exit statuses
-wait \$PID1; ERR1=\$?
-wait \$PID2; ERR2=\$?
-
-if [ \$ERR1 -ne 0 ] || [ \$ERR2 -ne 0 ]; then
-    exit 1
-fi
-EOF
-
-chmod +x /tmp/clp_parallel_mig.sh
-execute_with_spinner "Parallel Sync: Migrating Files & Database..." "/tmp/clp_parallel_mig.sh"
-rm -f /tmp/clp_parallel_mig.sh
+execute_with_spinner "Copying Site Files and Setting Permissions..." "$FILE_CMD"
 
 # ==========================================
 # 7. Config Updates & WP-CLI Search/Replace
