@@ -239,42 +239,112 @@ if [[ ${#SITES[@]} -eq 0 ]]; then
 fi
 
 # ==========================================
-# 2. Interactive Menu
+# 2. Interactive Menu (With Type-to-Filter)
 # ==========================================
 choose_site() {
-    local prompt="Use Up/Down arrows to select the production site, then press Enter:"
+    local prompt="Select site (Type to filter, Up/Down arrows, Enter to confirm):"
     local outvar="PROD_DOMAIN"
     local options=("${SITES[@]}")
+    local filtered=("${SITES[@]}")
     local cur=0
-    local count=${#options[@]}
-    local index=0
-    local esc=$(echo -en "\e")
+    local filter=""
+    local count=${#filtered[@]}
+    local display_limit=10 # Max items to show at once to prevent terminal overflow
 
-    echo "$prompt"
-    echo -en "\e[?25l" 
+    echo -e "\e[36m$prompt\e[0m"
+    echo -en "\e[?25l" # Hide cursor
+
     while true; do
-        index=0
-        for o in "${options[@]}"; do
-            if [ "$index" == "$cur" ]; then
+        # 1. Print Filter Bar
+        echo -e " \e[90mFilter:\e[0m \e[32m${filter}\e[0m\e[K"
+        
+        # 2. Setup display window size
+        count=${#filtered[@]}
+        local display_count=$count
+        [[ $display_count -gt $display_limit ]] && display_count=$display_limit
+        
+        [[ $cur -ge $count && $count -gt 0 ]] && cur=$((count - 1))
+        [[ $cur -lt 0 ]] && cur=0
+
+        # 3. Print Options
+        for ((i=0; i<display_count; i++)); do
+            local opt_idx=$i
+            # Scrolling logic if we move past the visible window
+            if [[ $cur -ge $display_limit && $count -gt $display_limit ]]; then
+                opt_idx=$((cur - display_limit + 1 + i))
+            fi
+            
+            if [[ $opt_idx -ge $count ]]; then
+                echo -e "\e[K" # Clear empty lines if list shrinks
+                continue
+            fi
+
+            local o="${filtered[$opt_idx]}"
+            if [ "$opt_idx" == "$cur" ]; then
                 echo -e " > \e[7m$o\e[0m\e[K" 
             else
                 echo -e "   $o\e[K"
             fi
-            index=$((index + 1))
         done
-        
-        read -s -n3 key || true
-        if [[ $key == $esc[A ]]; then cur=$((cur - 1)); [ $cur -lt 0 ] && cur=$((count - 1));
-        elif [[ $key == $esc[B ]]; then cur=$((cur + 1)); [ $cur -ge $count ] && cur=0;
-        elif [[ -z $key ]]; then break; fi
-        echo -en "\e[${count}A"
+
+        # 4. Read User Input (1 char at a time)
+        read -s -n1 key || true
+
+        if [[ $key == $'\e' ]]; then
+            # It's an escape sequence (arrow keys)
+            read -s -n2 -t 0.1 seq || true
+            if [[ $seq == "[A" ]]; then cur=$((cur - 1)); fi # Up
+            if [[ $seq == "[B" ]]; then cur=$((cur + 1)); fi # Down
+        elif [[ -z $key ]]; then
+            # Enter pressed
+            if [[ $count -gt 0 ]]; then
+                eval $outvar="${filtered[$cur]}"
+            else
+                eval $outvar=""
+            fi
+            break
+        elif [[ $key == $'\x7f' || $key == $'\x08' ]]; then
+            # Backspace pressed
+            if [[ -n $filter ]]; then
+                filter="${filter%?}"
+            fi
+        else
+            # Regular character typed (allow letters, numbers, dots, hyphens, underscores)
+            if [[ "$key" =~ [a-zA-Z0-9_.-] ]]; then
+                filter="${filter}${key}"
+            fi
+        fi
+
+        # 5. Re-filter the array if the input wasn't an arrow key
+        if [[ -n "$key" && "$key" != $'\e' ]]; then
+            filtered=()
+            for o in "${options[@]}"; do
+                # Case-insensitive match
+                if [[ "${o,,}" == *"${filter,,}"* ]]; then
+                    filtered+=("$o")
+                fi
+            done
+            cur=0 # Reset selection to top of filtered list
+        fi
+
+        # 6. Move cursor back up to seamlessly redraw the menu
+        echo -en "\e[$((display_count + 1))A"
     done
+
+    # Restore cursor and wipe the menu cleanly from the screen
     echo -en "\e[?25h" 
-    eval $outvar="${options[$cur]}"
+    for ((i=0; i<=display_count; i++)); do echo -en "\e[K\n"; done
+    echo -en "\e[$((display_count + 1))A"
 }
 
 choose_site
-echo -e "\nSelected Production Site: \e[32m$PROD_DOMAIN\e[0m\n"
+
+if [[ -z "$PROD_DOMAIN" ]]; then
+    echo -e "\e[31m[ERROR] No site selected. Aborting.\e[0m"
+    exit 1
+fi
+
+echo -e "Selected Production Site: \e[32m$PROD_DOMAIN\e[0m\n"
 
 # ==========================================
 # 3. Get Details & Prompts
