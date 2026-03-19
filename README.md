@@ -120,7 +120,7 @@ get_db_estimate() {
         if [[ -n "$size_mb" && "$size_mb" != "NULL" && "$size_mb" -gt 0 ]]; then
             local speed=$(get_disk_speed "/var/lib/mysql")
             # DB exports/imports are CPU/SQL bound, so we estimate they process at half the raw disk speed
-            local dump_speed=$(( speed / 7 ))
+            local dump_speed=$(( speed / 10 ))
             [[ $dump_speed -lt 10 ]] && dump_speed=10
             
             local eta=$(( size_mb / dump_speed ))
