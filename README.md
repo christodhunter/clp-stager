@@ -68,8 +68,8 @@ get_size_estimate() {
     local dir=$1
     if [ -d "$dir" ]; then
         local size_mb=$(du -sm "$dir" | cut -f1)
-        # Tuned for modern local NVMe/SSD speeds (~200 MB/s)
-        local eta=$(( size_mb / 200 ))
+        # Tuned for modern local NVMe/SSD speeds (~150 MB/s)
+        local eta=$(( size_mb / 150 ))
         [[ $eta -lt 1 ]] && eta=1
         echo "$size_mb MB (~$eta seconds)"
     else
