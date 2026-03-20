@@ -415,6 +415,23 @@ if [[ -n "$PROD_DB_NAME" ]]; then
 fi
 
 # ==========================================
+# 7.5 Clone Varnish Cache Settings
+# ==========================================
+PROD_VARNISH="/home/$SRC_USER/.varnish-cache/settings.json"
+STG_VARNISH_DIR="/home/$STG_USER/.varnish-cache"
+
+if [[ -f "$PROD_VARNISH" ]]; then
+    echo -e "\e[32m[✓]\e[0m Cloning Varnish Cache configuration..."
+    mkdir -p "$STG_VARNISH_DIR"
+    
+    # Copy the settings file and replace any instances of the production domain
+    sed "s/$PROD_DOMAIN/$STG_DOMAIN/g" "$PROD_VARNISH" > "$STG_VARNISH_DIR/settings.json"
+    
+    # Ensure the new staging user owns the copied Varnish config
+    chown -R "$STG_USER:$STG_USER" "$STG_VARNISH_DIR"
+fi
+
+# ==========================================
 # 8. Clone Custom vHost Edits (Safe Fallback)
 # ==========================================
 PROD_VHOST="/etc/nginx/sites-enabled/$PROD_DOMAIN.conf"
