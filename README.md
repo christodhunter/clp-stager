@@ -28,7 +28,6 @@ SSH into your CloudPanel server as the `root` user:
 
 ```bash
 ssh root@your-server-ip
-
 ```
 
 ### Step 2: Create the script file
@@ -37,10 +36,10 @@ Open the `nano` text editor to create the file:
 
 ```bash
 nano /root/make-staging.sh && chmod +x /root/make-staging.sh
-
 ```
 
 Copy the code below, paste it into the `nano` editor, save (CTRL+S), and exit (CTRL+X):
+
 
 <details markdown="1">
 <summary><strong>Click to expand the Bash Script</strong></summary>
@@ -527,13 +526,13 @@ echo "========================================================"
 </details>
 
 
+
 ### Step 3: Run the Script
 
 Whenever you want to spin up a staging site, simply run:
 
 ```bash
 /root/make-staging.sh
-
 ```
 
 Use your arrow keys to select the production site, type in your staging domain (e.g., `stg.example.com`), and the script will automatically clone the files and database!
@@ -551,7 +550,6 @@ clpctl db:delete --databaseName=your_staging_database_name
 
 # 2. Delete the staging site and user files
 clpctl site:delete --domainName=stg.example.com
-
 ```
 
 
