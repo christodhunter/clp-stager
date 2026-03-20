@@ -14,7 +14,9 @@ It automatically:
 
 5. Auto-updates Laravel (`.env`) or WordPress (`wp-config.php`) with the new staging database credentials.
 
-6. Asks to issue Let's Encrypt cetificates by listing all the required domains, make sure you've pointed the DNS records before proceeding.
+6. Clones Varnish configuration
+
+7. Asks to issue Let's Encrypt cetificates by listing all the required domains, make sure you've pointed the DNS records before proceeding.
 
 ## 🚀 How to Install & Run on Your Server
 
