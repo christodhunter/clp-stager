@@ -456,7 +456,10 @@ STG_VHOST="/etc/nginx/sites-enabled/$STG_DOMAIN.conf"
 [[ ! -f "$PROD_VHOST" ]] && PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf" && STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
 
 if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
-    sed -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" -e "s/$SRC_USER/$STG_USER/g" "$PROD_VHOST" > "$STG_VHOST"
+    sed -e "s|/home/$SRC_USER/|/home/$STG_USER/|g" \
+    -e "s|-$SRC_USER\.sock|-$STG_USER.sock|g" \
+    -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" \
+    "$PROD_VHOST" > "$STG_VHOST"
     if nginx -t >/dev/null 2>&1; then
         systemctl reload nginx
         echo -e "\e[32m[✓]\e[0m Custom Nginx vHost settings copied successfully."
