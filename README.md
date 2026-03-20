@@ -557,7 +557,7 @@ clpctl site:delete --domainName=stg.example.com
 
 
 
-
+<div style="display:none" markdown="0">
 <style>
   /* Style the copy button to look good on dark themes */
   .copy-btn {
@@ -612,3 +612,4 @@ clpctl site:delete --domainName=stg.example.com
     });
   });
 </script>
+</div>
