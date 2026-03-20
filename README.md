@@ -553,3 +553,62 @@ clpctl db:delete --databaseName=your_staging_database_name
 clpctl site:delete --domainName=stg.example.com
 
 ```
+
+
+
+
+
+<style>
+  /* Style the copy button to look good on dark themes */
+  .copy-btn {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background-color: #444;
+    color: #fff;
+    border: 1px solid #666;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.2s, background-color 0.2s;
+    z-index: 10;
+  }
+  .copy-btn:hover {
+    opacity: 1;
+    background-color: #555;
+  }
+</style>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    // Find all the code blocks that GitHub Pages generates
+    var codeBlocks = document.querySelectorAll('div.highlighter-rouge');
+    
+    codeBlocks.forEach(function(block) {
+      // Make sure the button positions itself correctly inside the block
+      block.style.position = 'relative'; 
+
+      // Create the button
+      var button = document.createElement('button');
+      button.className = 'copy-btn';
+      button.innerText = 'Copy';
+
+      // Add the click event to copy the text
+      button.addEventListener('click', function() {
+        var code = block.querySelector('code').innerText;
+        navigator.clipboard.writeText(code).then(function() {
+          // Visual feedback that it worked
+          button.innerText = 'Copied!';
+          setTimeout(function() {
+            button.innerText = 'Copy';
+          }, 2000);
+        });
+      });
+
+      // Attach the button to the code block
+      block.appendChild(button);
+    });
+  });
+</script>
