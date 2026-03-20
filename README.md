@@ -64,45 +64,15 @@ fi
 # ==========================================
 # PERFORMANCE & HARDWARE HELPERS
 # ==========================================
-get_disk_speed() {
-    local target_dir=$1
-    local speed=150 # Default to standard SATA SSD (150 MB/s)
-    
-    # Find the block device where this directory lives
-    local device=$(df "$target_dir" | tail -n 1 | awk '{print $1}')
-    
-    # Check if rotational (1 = HDD, 0 = SSD/NVMe)
-    local is_hdd=0
-    if command -v lsblk &> /dev/null; then
-        is_hdd=$(lsblk -no ROTA "$device" 2>/dev/null | head -n 1 | tr -d ' ')
-    fi
-    
-    if [[ "$is_hdd" == "1" ]]; then
-        speed=50  # Slow HDD
-    elif [[ "$is_hdd" == "0" ]]; then
-        if [[ "$device" == *"nvme"* ]]; then
-            speed=300 # Fast NVMe
-        else
-            speed=150 # Standard SSD
-        fi
-    fi
-    echo "$speed"
-}
-
 get_size_estimate() {
     local dir=$1
     if [ -d "$dir" ]; then
-        local speed=$(get_disk_speed "$dir")
         local size_mb=$(du -sm "$dir" | cut -f1)
         
-        local eta=$(( size_mb / speed ))
+        local eta=$(( size_mb / 150 ))
         [[ $eta -lt 1 ]] && eta=1
         
-        local drive_type="SSD"
-        [[ "$speed" == 50 ]] && drive_type="HDD"
-        [[ "$speed" == 300 ]] && drive_type="NVMe"
-        
-        echo "$size_mb MB (~$eta seconds on $drive_type)"
+        echo "$size_mb MB (~$eta seconds)"
     else
         echo "0 MB"
     fi
@@ -118,12 +88,8 @@ get_db_estimate() {
         local size_mb=$(mysql -h 127.0.0.1 -u root -p"$db_root_pass" -Bse "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 0) FROM information_schema.tables WHERE table_schema = '$db_name';" 2>/dev/null)
         
         if [[ -n "$size_mb" && "$size_mb" != "NULL" && "$size_mb" -gt 0 ]]; then
-            local speed=$(get_disk_speed "/var/lib/mysql")
-            # DB exports/imports are CPU/SQL bound, so we estimate they process at half the raw disk speed
-            local dump_speed=$(( speed / 10 ))
-            [[ $dump_speed -lt 10 ]] && dump_speed=10
-            
-            local eta=$(( size_mb / dump_speed ))
+            # DB exports/imports are CPU/SQL bound, assume roughly 15MB/s processing
+            local eta=$(( size_mb / 15 ))
             [[ $eta -lt 1 ]] && eta=1
             
             echo "$size_mb MB (~$eta seconds)"
@@ -333,8 +299,8 @@ choose_site() {
 
     # Restore cursor and wipe the menu cleanly from the screen
     echo -en "\e[?25h" 
-    for ((i=0; i<=display_count; i++)); do echo -en "\e[K\n"; done
-    echo -en "\e[$((display_count + 1))A"
+    for ((i=0; i<=display_limit; i++)); do echo -en "\e[K\n"; done
+    echo -en "\e[$((display_limit + 1))A"
 }
 
 choose_site
