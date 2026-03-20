@@ -456,10 +456,20 @@ STG_VHOST="/etc/nginx/sites-enabled/$STG_DOMAIN.conf"
 [[ ! -f "$PROD_VHOST" ]] && PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf" && STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
 
 if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
+    # Extract the newly generated PHP port for the staging site
+    STG_PORT=$(grep "fastcgi_pass" "$STG_VHOST" | awk '{print $2}' | tr -d ';')
+
+    # Clone the custom vHost edits AND strictly fix paths safely
     sed -e "s|/home/$SRC_USER/|/home/$STG_USER/|g" \
-    -e "s|-$SRC_USER\.sock|-$STG_USER.sock|g" \
-    -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" \
-    "$PROD_VHOST" > "$STG_VHOST"
+        -e "s|-$SRC_USER\.sock|-$STG_USER.sock|g" \
+        -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" \
+        "$PROD_VHOST" > "$STG_VHOST"
+    
+    # Inject the correct staging PHP port back into the cloned vHost
+    if [[ -n "$STG_PORT" ]]; then
+        sed -i "s/fastcgi_pass.*/fastcgi_pass $STG_PORT;/g" "$STG_VHOST"
+    fi
+
     if nginx -t >/dev/null 2>&1; then
         systemctl reload nginx
         echo -e "\e[32m[✓]\e[0m Custom Nginx vHost settings copied successfully."
