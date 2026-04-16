@@ -404,9 +404,11 @@ if [[ -n "$PROD_DB_NAME" ]]; then
             sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$STG_DOMAIN');\ndefine('WP_SITEURL', 'https://$STG_DOMAIN');" "$DEST_DIR/wp-config.php"
         fi
 
-        if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
+                if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
             sed -i "s/define( *'DOMAIN_CURRENT_SITE', *'[^']*' *);/define('DOMAIN_CURRENT_SITE', '$STG_DOMAIN');/g" "$DEST_DIR/wp-config.php"
             execute_with_spinner "Multisite Detected: Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"$PROD_DOMAIN\" \"$STG_DOMAIN\" --network --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
+        else
+            execute_with_spinner "Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"https://$PROD_DOMAIN\" \"https://$STG_DOMAIN\" --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
         fi
     elif [[ -f "$DEST_DIR/.env" ]]; then
         sed -i "s/DB_DATABASE=.*/DB_DATABASE=$STG_DB_NAME/g" "$DEST_DIR/.env"
