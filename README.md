@@ -1,6 +1,6 @@
 # CloudPanel Stager (`clp-stager`)
 
-A lightweight **staging site manager** for CloudPanel: create, refresh, or remove staging environments from an interactive menu.
+A lightweight **staging site manager** for CloudPanel: create, refresh, or remove staging environments from an interactive menu with app-aware handling for **WordPress** and **Laravel**.
 
 ## Main menu
 
@@ -18,14 +18,19 @@ Staging sites are identified by domain names containing `staging` or `studiorepu
 - Live source is auto-detected when the name matches `staging.<live>` (e.g. `staging.test.com` → `test.com`).
 - If detection fails or is ambiguous, you choose from live (non-staging) PHP sites.
 - Type `yes` to confirm overwrite.
-- Replaces staging DB and files; **preserves** root `wp-config.php` and `.env`.
-- Runs WordPress WP-CLI `search-replace` for live → staging URLs (http and https).
+- Replaces staging DB and files with app-aware behavior:
+  - **WordPress:** preserves root `wp-config.php` and `.env`, reapplies URL/domain updates, sets `WP_ENV=local`, runs WP-CLI `search-replace`.
+  - **Laravel:** preserves `.env`, then rewrites staging-safe keys (`APP_ENV`, `APP_DEBUG`, `APP_URL`, cache/session/queue/mail/filesystem settings) and runs post-refresh Artisan cleanup commands.
+  - **Generic PHP:** full file sync, no framework-specific post-steps.
 
 ### Create new staging site
 
 1. Pick a **live** site (staging domains excluded from the list).
 2. Enter staging prefix or full domain (prefix auto-appends to live domain).
-3. Provisions site, clones DB/files, updates config, Varnish, vHost; optional SSL.
+3. Provisions site, clones DB/files, updates app config:
+   - **WordPress:** DB constants, `WP_HOME`, `WP_SITEURL`, multisite domain updates, `WP_ENV=local`, WP-CLI search-replace.
+   - **Laravel:** `.env` updates for APP/DB/cache/session/queue/mail/filesystem and post-migration Artisan commands (`config:clear`, `cache:clear`, `route:clear`, `view:clear`, optional `config:cache`, `storage:link`, `queue:restart`).
+4. Clones Varnish config, copies vHost customizations, and optionally issues SSL.
 
 ### Remove staging site
 
@@ -59,7 +64,7 @@ nano /root/make-staging.sh && chmod +x /root/make-staging.sh
 ```bash
 #!/usr/bin/env bash
 # clp-stager: CloudPanel Staging Site Manager
-# Features: Create, remove, refresh staging sites; Multisite, vHost cloning, auto-cleanup on create errors
+# Features: Create, remove, refresh staging sites; WordPress/Laravel handling, vHost cloning, auto-cleanup on create errors
 
 set -e
 DB_PATH="/home/clp/htdocs/app/data/db.sq3"

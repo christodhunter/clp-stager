@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # clp-stager: CloudPanel Staging Site Manager
-# Features: Create, remove, refresh staging sites; Multisite, vHost cloning, auto-cleanup on create errors
+# Features: Create, remove, refresh staging sites; WordPress/Laravel handling, vHost cloning, auto-cleanup on create errors
 
 set -e
 DB_PATH="/home/clp/htdocs/app/data/db.sq3"
@@ -64,6 +64,8 @@ STG_DOMAIN=""
 STG_DB_NAME=""
 PROD_DB_NAME=""
 CURRENT_PID=""
+PROD_APP_TYPE="generic"
+STG_APP_TYPE="generic"
 
 cleanup_on_error() {
     local exit_code=$?
@@ -211,6 +213,7 @@ load_prod_metadata() {
     fi
 
     SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
+    PROD_APP_TYPE=$(detect_site_app_type "$SRC_DIR")
 }
 
 resolve_live_domain() {
@@ -367,6 +370,190 @@ choose_site() {
     echo -en "\e[$((display_limit + 1))A"
 }
 
+detect_site_app_type() {
+    local site_dir="$1"
+    if [[ -f "$site_dir/wp-config.php" ]]; then
+        echo "wordpress"
+    elif [[ -f "$site_dir/artisan" && -f "$site_dir/config/app.php" ]]; then
+        echo "laravel"
+    else
+        echo "generic"
+    fi
+}
+
+set_env_key() {
+    local env_file="$1"
+    local key="$2"
+    local value="$3"
+    local escaped_value="${value//\\/\\\\}"
+    escaped_value="${escaped_value//&/\\&}"
+
+    if grep -Eq "^[[:space:]]*${key}=" "$env_file"; then
+        sed -i "s|^[[:space:]]*${key}=.*|${key}=${escaped_value}|g" "$env_file"
+    else
+        printf "%s=%s\n" "$key" "$value" >> "$env_file"
+    fi
+}
+
+ensure_laravel_env_file() {
+    local dest_dir="$1"
+    local env_file="$dest_dir/.env"
+    if [[ -f "$env_file" ]]; then
+        return 0
+    fi
+
+    if [[ -f "$dest_dir/.env.example" ]]; then
+        cp "$dest_dir/.env.example" "$env_file"
+        echo -e "\e[33m[!]\e[0m .env was missing. Created from .env.example."
+        return 0
+    fi
+
+    echo -e "\e[31m[ERROR] Laravel .env and .env.example are both missing in $dest_dir.\e[0m"
+    return 1
+}
+
+warn_if_production_like_laravel_env() {
+    local env_file="$1"
+    if [[ ! -f "$env_file" ]]; then
+        return 0
+    fi
+
+    local app_env mailer queue
+    app_env=$(grep -E "^[[:space:]]*APP_ENV=" "$env_file" | tail -n1 | cut -d= -f2- | tr -d '\r')
+    mailer=$(grep -E "^[[:space:]]*MAIL_MAILER=" "$env_file" | tail -n1 | cut -d= -f2- | tr -d '\r')
+    queue=$(grep -E "^[[:space:]]*QUEUE_CONNECTION=" "$env_file" | tail -n1 | cut -d= -f2- | tr -d '\r')
+
+    if [[ "$app_env" == "production" || "$mailer" == "smtp" || "$queue" == "redis" || "$queue" == "sqs" ]]; then
+        echo -e "\e[33m[!]\e[0m Production-like Laravel settings detected before rewrite (APP_ENV/MAIL/QUEUE). Applying staging-safe defaults."
+    fi
+}
+
+configure_wordpress_wp_env() {
+    local wp_config="$1"
+    if grep -Eq "define\(\s*'WP_ENV'\s*," "$wp_config"; then
+        sed -i "s/define( *'WP_ENV', *'[^']*' *);/define('WP_ENV', 'local');/g" "$wp_config"
+    elif grep -q "stop editing" "$wp_config"; then
+        sed -i "/stop editing/i define('WP_ENV', 'local');" "$wp_config"
+    else
+        printf "\ndefine('WP_ENV', 'local');\n" >> "$wp_config"
+    fi
+}
+
+configure_wordpress_staging() {
+    local dest_dir="$1"
+    local stg_user="$2"
+    local prod_domain="$3"
+    local stg_domain="$4"
+    local stg_db_name="$5"
+    local stg_db_user="$6"
+    local stg_db_pass="$7"
+    local update_db_creds="$8"
+    local wp_config="$dest_dir/wp-config.php"
+
+    if [[ ! -f "$wp_config" ]]; then
+        echo -e "\e[34m[i]\e[0m No wp-config.php found. Skipping WordPress configuration."
+        return 0
+    fi
+
+    if [[ "$update_db_creds" == "true" && -n "$stg_db_name" ]]; then
+        sed -i "s/define( *'DB_NAME', *'[^']*' *);/define('DB_NAME', '$stg_db_name');/g" "$wp_config"
+        sed -i "s/define( *'DB_USER', *'[^']*' *);/define('DB_USER', '$stg_db_user');/g" "$wp_config"
+        sed -i "s/define( *'DB_PASSWORD', *'[^']*' *);/define('DB_PASSWORD', '$stg_db_pass');/g" "$wp_config"
+    fi
+
+    if grep -q "WP_HOME" "$wp_config"; then
+        sed -i "s|define( *'WP_HOME', *'[^']*' *);|define('WP_HOME', 'https://$stg_domain');|g" "$wp_config"
+        sed -i "s|define( *'WP_SITEURL', *'[^']*' *);|define('WP_SITEURL', 'https://$stg_domain');|g" "$wp_config"
+    else
+        sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$stg_domain');\ndefine('WP_SITEURL', 'https://$stg_domain');" "$wp_config"
+    fi
+
+    configure_wordpress_wp_env "$wp_config"
+
+    if grep -q "DOMAIN_CURRENT_SITE" "$wp_config"; then
+        sed -i "s/define( *'DOMAIN_CURRENT_SITE', *'[^']*' *);/define('DOMAIN_CURRENT_SITE', '$stg_domain');/g" "$wp_config"
+        execute_with_spinner "Multisite Detected: Running WP-CLI search-replace..." "sudo -u \"$stg_user\" wp search-replace \"$prod_domain\" \"$stg_domain\" --network --skip-plugins --skip-themes --path=\"$dest_dir\"" "true"
+    else
+        execute_with_spinner "Running WP-CLI search-replace (https)..." "sudo -u \"$stg_user\" wp search-replace \"https://$prod_domain\" \"https://$stg_domain\" --skip-plugins --skip-themes --path=\"$dest_dir\"" "true"
+        execute_with_spinner "Running WP-CLI search-replace (http)..." "sudo -u \"$stg_user\" wp search-replace \"http://$prod_domain\" \"http://$stg_domain\" --skip-plugins --skip-themes --path=\"$dest_dir\"" "true"
+    fi
+}
+
+configure_laravel_staging() {
+    local dest_dir="$1"
+    local stg_user="$2"
+    local stg_domain="$3"
+    local stg_db_name="$4"
+    local stg_db_user="$5"
+    local stg_db_pass="$6"
+    local update_db_creds="$7"
+    local env_file="$dest_dir/.env"
+
+    ensure_laravel_env_file "$dest_dir"
+    env_file="$dest_dir/.env"
+
+    if [[ ! -w "$env_file" ]]; then
+        echo -e "\e[31m[ERROR] Laravel .env is not writable: $env_file\e[0m"
+        exit 1
+    fi
+
+    warn_if_production_like_laravel_env "$env_file"
+
+    set_env_key "$env_file" "APP_ENV" "local"
+    set_env_key "$env_file" "APP_DEBUG" "true"
+    set_env_key "$env_file" "APP_URL" "https://$stg_domain"
+
+    if [[ "$update_db_creds" == "true" && -n "$stg_db_name" ]]; then
+        set_env_key "$env_file" "DB_CONNECTION" "mysql"
+        set_env_key "$env_file" "DB_HOST" "127.0.0.1"
+        set_env_key "$env_file" "DB_PORT" "3306"
+        set_env_key "$env_file" "DB_DATABASE" "$stg_db_name"
+        set_env_key "$env_file" "DB_USERNAME" "$stg_db_user"
+        set_env_key "$env_file" "DB_PASSWORD" "$stg_db_pass"
+    fi
+
+    set_env_key "$env_file" "CACHE_STORE" "file"
+    set_env_key "$env_file" "CACHE_DRIVER" "file"
+    set_env_key "$env_file" "SESSION_DRIVER" "file"
+    set_env_key "$env_file" "QUEUE_CONNECTION" "sync"
+    set_env_key "$env_file" "MAIL_MAILER" "log"
+    set_env_key "$env_file" "FILESYSTEM_DISK" "local"
+
+    chown "$stg_user:$stg_user" "$env_file"
+    echo -e "\e[32m[✓]\e[0m Updated Laravel .env for staging/local mode."
+
+    if [[ -f "$dest_dir/artisan" ]]; then
+        execute_with_spinner "Laravel: php artisan config:clear..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan config:clear"
+        execute_with_spinner "Laravel: php artisan cache:clear..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan cache:clear"
+        execute_with_spinner "Laravel: php artisan route:clear..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan route:clear"
+        execute_with_spinner "Laravel: php artisan view:clear..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan view:clear"
+        execute_with_spinner "Laravel: php artisan config:cache..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan config:cache" "true"
+        execute_with_spinner "Laravel: php artisan storage:link..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan storage:link" "true"
+        execute_with_spinner "Laravel: php artisan queue:restart..." "cd \"$dest_dir\" && sudo -u \"$stg_user\" php artisan queue:restart" "true"
+    else
+        echo -e "\e[33m[!]\e[0m Laravel detected but artisan was not found in destination. Skipping Artisan post-migration commands."
+    fi
+}
+
+configure_generic_php_staging() {
+    local dest_dir="$1"
+    local stg_user="$2"
+    local stg_db_name="$3"
+    local stg_db_user="$4"
+    local stg_db_pass="$5"
+    local update_db_creds="$6"
+
+    if [[ "$update_db_creds" == "true" && -n "$stg_db_name" && -f "$dest_dir/.env" ]]; then
+        set_env_key "$dest_dir/.env" "DB_DATABASE" "$stg_db_name"
+        set_env_key "$dest_dir/.env" "DB_USERNAME" "$stg_db_user"
+        set_env_key "$dest_dir/.env" "DB_PASSWORD" "$stg_db_pass"
+        chown "$stg_user:$stg_user" "$dest_dir/.env"
+        echo -e "\e[32m[✓]\e[0m Updated generic .env DB credentials."
+    else
+        echo -e "\e[34m[i]\e[0m Generic PHP site detected. No framework-specific post-migration tasks were run."
+    fi
+}
+
 run_refresh_staging() {
     if [[ ${#STAGING_SITES[@]} -eq 0 ]]; then
         echo -e "\e[31m[ERROR] No staging sites found (domains containing staging or studiorepublic).\e[0m"
@@ -393,6 +580,7 @@ run_refresh_staging() {
 
     resolve_live_domain "$STG_DOMAIN"
     load_prod_metadata
+    echo -e "\e[34m[i]\e[0m Detected source app type: \e[32m$PROD_APP_TYPE\e[0m"
 
     echo -e "\e[33mWARNING: This will OVERWRITE the staging site.\e[0m"
     echo ""
@@ -400,8 +588,19 @@ run_refresh_staging() {
     echo "  Destination:       $STG_DOMAIN"
     echo ""
     echo "  - Staging database replaced with export from live"
-    echo "  - Files copied from live (root wp-config.php and .env preserved)"
-    echo "  - WordPress DB URLs search-replaced: $PROD_DOMAIN -> $STG_DOMAIN"
+    case "$PROD_APP_TYPE" in
+        wordpress)
+            echo "  - Files copied from live (root wp-config.php and .env preserved for WordPress safety)"
+            echo "  - WordPress DB URLs search-replaced: $PROD_DOMAIN -> $STG_DOMAIN"
+            ;;
+        laravel)
+            echo "  - Files copied from live (.env preserved, then Laravel staging keys reapplied)"
+            echo "  - Laravel APP/queue/cache/mail/storage defaults reset for local/staging safety"
+            ;;
+        *)
+            echo "  - Files copied from live (generic PHP mode)"
+            ;;
+    esac
     echo ""
     read -p "Type 'yes' to continue: " CONFIRM_REFRESH
 
@@ -434,20 +633,37 @@ run_refresh_staging() {
     FILE_ESTIMATE=$(get_size_estimate "$SRC_DIR")
     echo -e "\e[34m[i]\e[0m File Volume: $FILE_ESTIMATE"
 
-    FILE_CMD="tar --exclude='./wp-config.php' --exclude='./.env' -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+    case "$PROD_APP_TYPE" in
+        wordpress)
+            FILE_CMD="tar --exclude='./wp-config.php' --exclude='./.env' -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+            ;;
+        laravel)
+            FILE_CMD="tar --exclude='./.env' -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+            ;;
+        *)
+            FILE_CMD="tar -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+            ;;
+    esac
 
     execute_with_spinner "Copying Site Files and Setting Permissions..." "$FILE_CMD"
 
-    if [[ -f "$DEST_DIR/wp-config.php" ]]; then
-        if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
-            execute_with_spinner "Multisite: Running WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"$PROD_DOMAIN\" \"$STG_DOMAIN\" --network --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
-        else
-            execute_with_spinner "Running WP-CLI search-replace (https)..." "sudo -u \"$STG_USER\" wp search-replace \"https://$PROD_DOMAIN\" \"https://$STG_DOMAIN\" --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
-            execute_with_spinner "Running WP-CLI search-replace (http)..." "sudo -u \"$STG_USER\" wp search-replace \"http://$PROD_DOMAIN\" \"http://$STG_DOMAIN\" --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
-        fi
-    else
-        echo -e "\e[34m[i]\e[0m No wp-config.php found. Skipping WordPress DB domain search-replace."
-    fi
+    STG_APP_TYPE=$(detect_site_app_type "$DEST_DIR")
+    echo -e "\e[34m[i]\e[0m Detected destination app type: \e[32m$STG_APP_TYPE\e[0m"
+
+    ENV_SUMMARY="none"
+    case "$STG_APP_TYPE" in
+        wordpress)
+            configure_wordpress_staging "$DEST_DIR" "$STG_USER" "$PROD_DOMAIN" "$STG_DOMAIN" "" "" "" "false"
+            ENV_SUMMARY="WP_ENV=local"
+            ;;
+        laravel)
+            configure_laravel_staging "$DEST_DIR" "$STG_USER" "$STG_DOMAIN" "" "" "" "false"
+            ENV_SUMMARY="APP_ENV=local"
+            ;;
+        *)
+            configure_generic_php_staging "$DEST_DIR" "$STG_USER" "" "" "" "false"
+            ;;
+    esac
 
     trap - EXIT INT TERM
 
@@ -455,6 +671,8 @@ run_refresh_staging() {
     echo -e "✅ \e[32mRefresh Complete!\e[0m"
     echo "Live site:       $PROD_DOMAIN"
     echo "Staging site:    $STG_DOMAIN"
+    echo "App Type:        $STG_APP_TYPE"
+    echo "Environment:     $ENV_SUMMARY"
     echo "SSH/SFTP User:   $STG_USER (unchanged)"
     if [[ -n "$STG_DB_NAME" ]]; then
         echo "Database:        $STG_DB_NAME (unchanged credentials in wp-config/.env)"
@@ -528,6 +746,7 @@ run_create_from_live() {
     echo -e "Selected LIVE site: \e[32m$PROD_DOMAIN\e[0m\n"
 
     load_prod_metadata
+    echo -e "\e[34m[i]\e[0m Detected source app type: \e[32m$PROD_APP_TYPE\e[0m"
 
     echo -e "\e[36m[i] Tip: Type just a prefix (e.g., 'stg') to auto-append '.$PROD_DOMAIN', or type a full domain.\e[0m"
     read -p "Enter staging prefix or full domain: " STG_DOMAIN
@@ -579,31 +798,23 @@ run_create_from_live() {
     execute_with_spinner "Copying Site Files and Setting Permissions..." "$FILE_CMD"
 
     echo -e "\e[32m[✓]\e[0m Updating environment config files..."
-    if [[ -n "$PROD_DB_NAME" ]]; then
-        if [[ -f "$DEST_DIR/wp-config.php" ]]; then
-            sed -i "s/define( *'DB_NAME', *'[^']*' *);/define('DB_NAME', '$STG_DB_NAME');/g" "$DEST_DIR/wp-config.php"
-            sed -i "s/define( *'DB_USER', *'[^']*' *);/define('DB_USER', '$STG_DB_USER');/g" "$DEST_DIR/wp-config.php"
-            sed -i "s/define( *'DB_PASSWORD', *'[^']*' *);/define('DB_PASSWORD', '$STG_DB_PASS');/g" "$DEST_DIR/wp-config.php"
+    STG_APP_TYPE=$(detect_site_app_type "$DEST_DIR")
+    echo -e "\e[34m[i]\e[0m Detected destination app type: \e[32m$STG_APP_TYPE\e[0m"
 
-            if grep -q "WP_HOME" "$DEST_DIR/wp-config.php"; then
-                sed -i "s|define( *'WP_HOME', *'[^']*' *);|define('WP_HOME', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
-                sed -i "s|define( *'WP_SITEURL', *'[^']*' *);|define('WP_SITEURL', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
-            else
-                sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$STG_DOMAIN');\ndefine('WP_SITEURL', 'https://$STG_DOMAIN');" "$DEST_DIR/wp-config.php"
-            fi
-
-            if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
-                sed -i "s/define( *'DOMAIN_CURRENT_SITE', *'[^']*' *);/define('DOMAIN_CURRENT_SITE', '$STG_DOMAIN');/g" "$DEST_DIR/wp-config.php"
-                execute_with_spinner "Multisite Detected: Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"$PROD_DOMAIN\" \"$STG_DOMAIN\" --network --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
-            else
-                execute_with_spinner "Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"https://$PROD_DOMAIN\" \"https://$STG_DOMAIN\" --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
-            fi
-        elif [[ -f "$DEST_DIR/.env" ]]; then
-            sed -i "s/DB_DATABASE=.*/DB_DATABASE=$STG_DB_NAME/g" "$DEST_DIR/.env"
-            sed -i "s/DB_USERNAME=.*/DB_USERNAME=$STG_DB_USER/g" "$DEST_DIR/.env"
-            sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=$STG_DB_PASS/g" "$DEST_DIR/.env"
-        fi
-    fi
+    ENV_SUMMARY="none"
+    case "$STG_APP_TYPE" in
+        wordpress)
+            configure_wordpress_staging "$DEST_DIR" "$STG_USER" "$PROD_DOMAIN" "$STG_DOMAIN" "$STG_DB_NAME" "$STG_DB_USER" "$STG_DB_PASS" "true"
+            ENV_SUMMARY="WP_ENV=local"
+            ;;
+        laravel)
+            configure_laravel_staging "$DEST_DIR" "$STG_USER" "$STG_DOMAIN" "$STG_DB_NAME" "$STG_DB_USER" "$STG_DB_PASS" "true"
+            ENV_SUMMARY="APP_ENV=local"
+            ;;
+        *)
+            configure_generic_php_staging "$DEST_DIR" "$STG_USER" "$STG_DB_NAME" "$STG_DB_USER" "$STG_DB_PASS" "true"
+            ;;
+    esac
 
     PROD_VARNISH="/home/$SRC_USER/.varnish-cache/settings.json"
     STG_VARNISH_DIR="/home/$STG_USER/.varnish-cache"
@@ -684,6 +895,8 @@ run_create_from_live() {
     echo -e "\n========================================================"
     echo -e "✅ \e[32mStaging Deployment Complete!\e[0m"
     echo "Staging Domain:  $STG_DOMAIN"
+    echo "App Type:        $STG_APP_TYPE"
+    echo "Environment:     $ENV_SUMMARY"
     echo "SSH/SFTP User:   $STG_USER"
     echo "SSH/SFTP Pass:   $STG_PASS"
     if [[ -n "$PROD_DB_NAME" ]]; then
