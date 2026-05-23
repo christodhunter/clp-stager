@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# clp-stager: High-Performance Staging Generator for CloudPanel
-# Features: Refresh existing staging OR create new, Sequential Sync, Multisite, vHost Cloning, Auto-Cleanup
+# clp-stager: CloudPanel Staging Site Manager
+# Features: Create, remove, refresh staging sites; Multisite, vHost cloning, auto-cleanup on create errors
 
 set -e
 DB_PATH="/home/clp/htdocs/app/data/db.sq3"
@@ -82,11 +82,11 @@ cleanup_on_error() {
         fi
         
         if [ "$STG_DB_CREATED" = true ] && [[ -n "$STG_DB_NAME" ]]; then
-            clpctl db:delete --databaseName="$STG_DB_NAME" >/dev/null 2>&1 || true
+            printf 'yes\n' | clpctl db:delete --databaseName="$STG_DB_NAME" >/dev/null 2>&1 || true
         fi
         
         if [ "$STG_DOMAIN_CREATED" = true ] && [[ -n "$STG_DOMAIN" ]]; then
-            clpctl site:delete --domainName="$STG_DOMAIN" >/dev/null 2>&1 || true
+            printf 'yes\n' | clpctl site:delete --domainName="$STG_DOMAIN" >/dev/null 2>&1 || true
         fi
         
         echo -e "\e[32m[✓] Cleanup complete. Your server is clean.\e[0m"
@@ -158,13 +158,103 @@ if [[ ${#SITES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-ADD_NEW_SENTINEL="__ADD_NEW_SITE__"
+ACTION_CREATE="__ACTION_CREATE__"
+ACTION_REMOVE="__ACTION_REMOVE__"
+ACTION_REFRESH="__ACTION_REFRESH__"
+
+STAGING_SITES=()
+LIVE_SITES=()
+
+is_staging_site() {
+    local dl="${1,,}"
+    [[ "$dl" == *staging* || "$dl" == *studiorepublic* ]]
+}
+
+build_site_lists() {
+    STAGING_SITES=()
+    LIVE_SITES=()
+    for d in "${SITES[@]}"; do
+        if is_staging_site "$d"; then
+            STAGING_SITES+=("$d")
+        else
+            LIVE_SITES+=("$d")
+        fi
+    done
+}
 
 option_label() {
-    if [[ "$1" == "$ADD_NEW_SENTINEL" ]]; then
-        echo "➕ Add a new staging site"
+    case "$1" in
+        "$ACTION_CREATE") echo "Create a new staging site" ;;
+        "$ACTION_REMOVE") echo "Remove a staging site" ;;
+        "$ACTION_REFRESH") echo "Refresh a staging site from live" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+candidate_add_unique() {
+    local live="$1"
+    local c
+    for c in "${RESOLVE_CANDIDATES[@]}"; do
+        [[ "$c" == "$live" ]] && return
+    done
+    RESOLVE_CANDIDATES+=("$live")
+}
+
+load_prod_metadata() {
+    SRC_USER=$(sqlite3 "$DB_PATH" "SELECT user FROM site WHERE domain_name = '$PROD_DOMAIN' LIMIT 1;" | tr -d '\r\n')
+    PHP_VERSION=$(sqlite3 "$DB_PATH" "SELECT php_version FROM php_settings WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;" | tr -d '\r\n')
+    PROD_DB_NAME=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;" | tr -d '\r\n')
+
+    if [[ -z "$PHP_VERSION" ]]; then
+        echo -e "\e[31m[ERROR] Could not determine PHP Version for $PROD_DOMAIN. Aborting.\e[0m"
+        exit 1
+    fi
+
+    SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
+}
+
+resolve_live_domain() {
+    local stg="$1"
+    local stg_lower="${stg,,}"
+    local live rest first
+
+    RESOLVE_CANDIDATES=()
+
+    for live in "${LIVE_SITES[@]}"; do
+        if [[ "$stg_lower" == "staging.${live,,}" ]]; then
+            candidate_add_unique "$live"
+        fi
+    done
+
+    first="${stg%%.*}"
+    rest="${stg#*.}"
+    if [[ ( "$first" == "staging" || "$first" == "stg" ) && -n "$rest" && "$rest" != "$stg" ]]; then
+        for live in "${LIVE_SITES[@]}"; do
+            if [[ "${live,,}" == "${rest,,}" ]]; then
+                candidate_add_unique "$live"
+            fi
+        done
+    fi
+
+    if [[ ${#RESOLVE_CANDIDATES[@]} -eq 1 ]]; then
+        PROD_DOMAIN="${RESOLVE_CANDIDATES[0]}"
+        echo -e "\e[34m[i]\e[0m Live site detected: \e[32m$PROD_DOMAIN\e[0m\n"
+        return 0
+    fi
+
+    if [[ ${#RESOLVE_CANDIDATES[@]} -gt 1 ]]; then
+        choose_site "Could not auto-detect live site — select source (filter, arrows, Enter):" PROD_DOMAIN "${RESOLVE_CANDIDATES[@]}"
     else
-        echo "$1"
+        if [[ ${#LIVE_SITES[@]} -eq 0 ]]; then
+            echo -e "\e[31m[ERROR] No live (non-staging) sites found to use as source.\e[0m"
+            exit 1
+        fi
+        choose_site "Could not auto-detect live site — select source (filter, arrows, Enter):" PROD_DOMAIN "${LIVE_SITES[@]}"
+    fi
+
+    if [[ -z "$PROD_DOMAIN" ]]; then
+        echo -e "\e[31m[ERROR] No live site selected. Aborting.\e[0m"
+        exit 1
     fi
 }
 
@@ -277,50 +367,19 @@ choose_site() {
     echo -en "\e[$((display_limit + 1))A"
 }
 
-choose_site "Select LIVE site to copy from (Type to filter, arrows, Enter):" PROD_DOMAIN "${SITES[@]}"
-
-if [[ -z "$PROD_DOMAIN" ]]; then
-    echo -e "\e[31m[ERROR] No site selected. Aborting.\e[0m"
-    exit 1
-fi
-
-echo -e "Selected LIVE site: \e[32m$PROD_DOMAIN\e[0m\n"
-
-# ==========================================
-# 3. Source metadata & destination menu
-# ==========================================
-SRC_USER=$(sqlite3 "$DB_PATH" "SELECT user FROM site WHERE domain_name = '$PROD_DOMAIN' LIMIT 1;" | tr -d '\r\n')
-PHP_VERSION=$(sqlite3 "$DB_PATH" "SELECT php_version FROM php_settings WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;" | tr -d '\r\n')
-PROD_DB_NAME=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE site_id = (SELECT id FROM site WHERE domain_name = '$PROD_DOMAIN') LIMIT 1;" | tr -d '\r\n')
-
-if [[ -z "$PHP_VERSION" ]]; then
-    echo -e "\e[31m[ERROR] Could not determine PHP Version for $PROD_DOMAIN. Aborting.\e[0m"
-    exit 1
-fi
-
-SRC_DIR="/home/$SRC_USER/htdocs/$PROD_DOMAIN"
-
-DEST_OPTIONS=()
-for d in "${SITES[@]}"; do
-    dl="${d,,}"
-    if [[ "$dl" == *staging* || "$dl" == *studiorepublic* ]]; then
-        [[ "$d" != "$PROD_DOMAIN" ]] && DEST_OPTIONS+=("$d")
+run_refresh_staging() {
+    if [[ ${#STAGING_SITES[@]} -eq 0 ]]; then
+        echo -e "\e[31m[ERROR] No staging sites found (domains containing staging or studiorepublic).\e[0m"
+        exit 1
     fi
-done
-DEST_OPTIONS+=("$ADD_NEW_SENTINEL")
 
-choose_site "Select destination (Type to filter, arrows, Enter):" DEST_CHOICE "${DEST_OPTIONS[@]}"
+    choose_site "Select staging site to refresh (filter, arrows, Enter):" STG_DOMAIN "${STAGING_SITES[@]}"
 
-if [[ -z "$DEST_CHOICE" ]]; then
-    echo -e "\e[31m[ERROR] No destination selected. Aborting.\e[0m"
-    exit 1
-fi
+    if [[ -z "$STG_DOMAIN" ]]; then
+        echo -e "\e[31m[ERROR] No staging site selected. Aborting.\e[0m"
+        exit 1
+    fi
 
-if [[ "$DEST_CHOICE" == "$ADD_NEW_SENTINEL" ]]; then
-    MODE="create"
-else
-    MODE="refresh"
-    STG_DOMAIN="$DEST_CHOICE"
     STG_USER=$(sqlite3 "$DB_PATH" "SELECT user FROM site WHERE domain_name = '$STG_DOMAIN' LIMIT 1;" | tr -d '\r\n')
     STG_DB_NAME=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE site_id = (SELECT id FROM site WHERE domain_name = '$STG_DOMAIN') LIMIT 1;" | tr -d '\r\n')
     DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
@@ -330,14 +389,17 @@ else
         exit 1
     fi
 
-    echo -e "Selected destination: \e[32m$STG_DOMAIN\e[0m\n"
+    echo -e "Selected staging site: \e[32m$STG_DOMAIN\e[0m\n"
 
-    echo -e "\e[33mWARNING: This will OVERWRITE the destination site.\e[0m"
+    resolve_live_domain "$STG_DOMAIN"
+    load_prod_metadata
+
+    echo -e "\e[33mWARNING: This will OVERWRITE the staging site.\e[0m"
     echo ""
     echo "  Source (live):     $PROD_DOMAIN"
     echo "  Destination:       $STG_DOMAIN"
     echo ""
-    echo "  - Destination database replaced with export from live"
+    echo "  - Staging database replaced with export from live"
     echo "  - Files copied from live (root wp-config.php and .env preserved)"
     echo "  - WordPress DB URLs search-replaced: $PROD_DOMAIN -> $STG_DOMAIN"
     echo ""
@@ -353,7 +415,7 @@ else
 
     if [[ -n "$PROD_DB_NAME" ]]; then
         if [[ -z "$STG_DB_NAME" ]]; then
-            echo -e "\e[31m[ERROR] Live site has database '$PROD_DB_NAME' but destination has no linked database. Aborting.\e[0m"
+            echo -e "\e[31m[ERROR] Live site has database '$PROD_DB_NAME' but staging has no linked database. Aborting.\e[0m"
             exit 1
         fi
 
@@ -366,7 +428,7 @@ else
 
         execute_with_spinner "Migrating Database ($PROD_DB_NAME -> $STG_DB_NAME)..." "$DB_CMD"
     else
-        echo -e "\e[34m[i]\e[0m No production database found. Skipping DB migration."
+        echo -e "\e[34m[i]\e[0m No live database found. Skipping DB migration."
     fi
 
     FILE_ESTIMATE=$(get_size_estimate "$SRC_DIR")
@@ -392,212 +454,274 @@ else
     echo -e "\n========================================================"
     echo -e "✅ \e[32mRefresh Complete!\e[0m"
     echo "Live site:       $PROD_DOMAIN"
-    echo "Destination:     $STG_DOMAIN"
+    echo "Staging site:    $STG_DOMAIN"
     echo "SSH/SFTP User:   $STG_USER (unchanged)"
     if [[ -n "$STG_DB_NAME" ]]; then
         echo "Database:        $STG_DB_NAME (unchanged credentials in wp-config/.env)"
     fi
     echo "========================================================"
-    exit 0
-fi
+}
 
-# ==========================================
-# CREATE NEW: domain prompt & provisioning
-# ==========================================
-# Explain the auto-append feature to the user
-echo -e "\e[36m[i] Tip: Type just a prefix (e.g., 'stg') to auto-append '.$PROD_DOMAIN', or type a full domain.\e[0m"
-read -p "Enter staging prefix or full domain: " STG_DOMAIN
+run_remove_staging() {
+    if [[ ${#STAGING_SITES[@]} -eq 0 ]]; then
+        echo -e "\e[31m[ERROR] No staging sites found (domains containing staging or studiorepublic).\e[0m"
+        exit 1
+    fi
 
-if [[ -z "$STG_DOMAIN" ]]; then echo "[ERROR] Domain required."; exit 1; fi
+    choose_site "Select staging site to remove (filter, arrows, Enter):" STG_DOMAIN "${STAGING_SITES[@]}"
 
-# If the input doesn't contain a dot, assume it's a prefix and auto-append
-if [[ "$STG_DOMAIN" != *"."* ]]; then
-    STG_DOMAIN="${STG_DOMAIN}.${PROD_DOMAIN}"
-    echo -e "  \e[90m↳ Auto-completed to: $STG_DOMAIN\e[0m"
-fi
+    if [[ -z "$STG_DOMAIN" ]]; then
+        echo -e "\e[31m[ERROR] No staging site selected. Aborting.\e[0m"
+        exit 1
+    fi
 
-CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-6)
-RND_STR=$(openssl rand -hex 2)
-STG_USER="stg${CLEAN_DOMAIN}${RND_STR}"
-STG_PASS="Stg1!$(openssl rand -hex 6)"
+    STG_USER=$(sqlite3 "$DB_PATH" "SELECT user FROM site WHERE domain_name = '$STG_DOMAIN' LIMIT 1;" | tr -d '\r\n')
+    STG_DB_NAME=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE site_id = (SELECT id FROM site WHERE domain_name = '$STG_DOMAIN') LIMIT 1;" | tr -d '\r\n')
 
-echo ""
+    echo -e "\e[33mWARNING: This will permanently delete the staging site.\e[0m"
+    echo ""
+    echo "  Domain:      $STG_DOMAIN"
+    echo "  Site user:   ${STG_USER:-unknown}"
+    if [[ -n "$STG_DB_NAME" ]]; then
+        echo "  Database:    $STG_DB_NAME"
+    else
+        echo "  Database:    (none linked)"
+    fi
+    echo ""
+    read -p "Type the staging domain to confirm deletion: " CONFIRM_REMOVE
 
-# ==========================================
-# 4. Provision Site
-# ==========================================
-CMD="clpctl site:add:php --domainName=\"$STG_DOMAIN\" --phpVersion=\"$PHP_VERSION\" --vhostTemplate=\"Generic\" --siteUser=\"$STG_USER\" --siteUserPassword=\"$STG_PASS\""
-execute_with_spinner "Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION..." "$CMD"
-STG_DOMAIN_CREATED=true
+    if [[ "$CONFIRM_REMOVE" != "$STG_DOMAIN" ]]; then
+        echo -e "\e[34m[i]\e[0m Aborted. No changes were made."
+        trap - EXIT INT TERM
+        exit 0
+    fi
 
-# ==========================================
-# 5. Database Migration
-# ==========================================
-if [[ -n "$PROD_DB_NAME" ]]; then
-    STG_DB_NAME="db${CLEAN_DOMAIN}${RND_STR}"
-    STG_DB_USER="u${CLEAN_DOMAIN}${RND_STR}"
-    STG_DB_PASS=$(openssl rand -hex 16)
-    STG_DB_CREATED=true
+    echo ""
 
-    DB_ESTIMATE=$(get_db_estimate "$PROD_DB_NAME")
-    echo -e "\e[34m[i]\e[0m Database Volume: $DB_ESTIMATE"
+    if [[ -n "$STG_DB_NAME" ]]; then
+        execute_with_spinner "Deleting database ($STG_DB_NAME)..." "printf 'yes\n' | clpctl db:delete --databaseName=\"$STG_DB_NAME\""
+    fi
 
-    # Build DB Migration Command Sequence
-    DB_CMD="clpctl db:export --databaseName=\"$PROD_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && \
-            clpctl db:add --domainName=\"$STG_DOMAIN\" --databaseName=\"$STG_DB_NAME\" --databaseUserName=\"$STG_DB_USER\" --databaseUserPassword=\"$STG_DB_PASS\" && \
-            clpctl db:import --databaseName=\"$STG_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && \
-            rm -f \"/tmp/${PROD_DB_NAME}.sql.gz\""
-            
-    execute_with_spinner "Migrating Database ($PROD_DB_NAME -> $STG_DB_NAME)..." "$DB_CMD"
-else
-    echo -e "\e[34m[i]\e[0m No production database found. Skipping DB migration."
-fi
+    execute_with_spinner "Deleting site ($STG_DOMAIN)..." "printf 'yes\n' | clpctl site:delete --domainName=\"$STG_DOMAIN\""
 
-# ==========================================
-# 6. File Migration
-# ==========================================
-DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
+    trap - EXIT INT TERM
 
-FILE_ESTIMATE=$(get_size_estimate "$SRC_DIR")
-echo -e "\e[34m[i]\e[0m File Volume: $FILE_ESTIMATE"
+    echo -e "\n========================================================"
+    echo -e "✅ \e[32mStaging Site Removed\e[0m"
+    echo "Deleted domain:  $STG_DOMAIN"
+    echo "========================================================"
+}
 
-FILE_CMD="tar -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+run_create_from_live() {
+    if [[ ${#LIVE_SITES[@]} -eq 0 ]]; then
+        echo -e "\e[31m[ERROR] No live sites found to copy from (all PHP sites appear to be staging).\e[0m"
+        exit 1
+    fi
 
-execute_with_spinner "Copying Site Files and Setting Permissions..." "$FILE_CMD"
+    choose_site "Select LIVE site to copy from (filter, arrows, Enter):" PROD_DOMAIN "${LIVE_SITES[@]}"
 
-# ==========================================
-# 7. Config Updates & WP-CLI Search/Replace
-# ==========================================
-echo -e "\e[32m[✓]\e[0m Updating environment config files..."
-if [[ -n "$PROD_DB_NAME" ]]; then
-    if [[ -f "$DEST_DIR/wp-config.php" ]]; then
-        sed -i "s/define( *'DB_NAME', *'[^']*' *);/define('DB_NAME', '$STG_DB_NAME');/g" "$DEST_DIR/wp-config.php"
-        sed -i "s/define( *'DB_USER', *'[^']*' *);/define('DB_USER', '$STG_DB_USER');/g" "$DEST_DIR/wp-config.php"
-        sed -i "s/define( *'DB_PASSWORD', *'[^']*' *);/define('DB_PASSWORD', '$STG_DB_PASS');/g" "$DEST_DIR/wp-config.php"
-        
-        if grep -q "WP_HOME" "$DEST_DIR/wp-config.php"; then
-            sed -i "s|define( *'WP_HOME', *'[^']*' *);|define('WP_HOME', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
-            sed -i "s|define( *'WP_SITEURL', *'[^']*' *);|define('WP_SITEURL', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
-        else
-            sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$STG_DOMAIN');\ndefine('WP_SITEURL', 'https://$STG_DOMAIN');" "$DEST_DIR/wp-config.php"
+    if [[ -z "$PROD_DOMAIN" ]]; then
+        echo -e "\e[31m[ERROR] No live site selected. Aborting.\e[0m"
+        exit 1
+    fi
+
+    echo -e "Selected LIVE site: \e[32m$PROD_DOMAIN\e[0m\n"
+
+    load_prod_metadata
+
+    echo -e "\e[36m[i] Tip: Type just a prefix (e.g., 'stg') to auto-append '.$PROD_DOMAIN', or type a full domain.\e[0m"
+    read -p "Enter staging prefix or full domain: " STG_DOMAIN
+
+    if [[ -z "$STG_DOMAIN" ]]; then echo "[ERROR] Domain required."; exit 1; fi
+
+    if [[ "$STG_DOMAIN" != *"."* ]]; then
+        STG_DOMAIN="${STG_DOMAIN}.${PROD_DOMAIN}"
+        echo -e "  \e[90m↳ Auto-completed to: $STG_DOMAIN\e[0m"
+    fi
+
+    CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-6)
+    RND_STR=$(openssl rand -hex 2)
+    STG_USER="stg${CLEAN_DOMAIN}${RND_STR}"
+    STG_PASS="Stg1!$(openssl rand -hex 6)"
+
+    echo ""
+
+    CMD="clpctl site:add:php --domainName=\"$STG_DOMAIN\" --phpVersion=\"$PHP_VERSION\" --vhostTemplate=\"Generic\" --siteUser=\"$STG_USER\" --siteUserPassword=\"$STG_PASS\""
+    execute_with_spinner "Creating CloudPanel site ($STG_DOMAIN) on PHP $PHP_VERSION..." "$CMD"
+    STG_DOMAIN_CREATED=true
+
+    if [[ -n "$PROD_DB_NAME" ]]; then
+        STG_DB_NAME="db${CLEAN_DOMAIN}${RND_STR}"
+        STG_DB_USER="u${CLEAN_DOMAIN}${RND_STR}"
+        STG_DB_PASS=$(openssl rand -hex 16)
+        STG_DB_CREATED=true
+
+        DB_ESTIMATE=$(get_db_estimate "$PROD_DB_NAME")
+        echo -e "\e[34m[i]\e[0m Database Volume: $DB_ESTIMATE"
+
+        DB_CMD="clpctl db:export --databaseName=\"$PROD_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && \
+                clpctl db:add --domainName=\"$STG_DOMAIN\" --databaseName=\"$STG_DB_NAME\" --databaseUserName=\"$STG_DB_USER\" --databaseUserPassword=\"$STG_DB_PASS\" && \
+                clpctl db:import --databaseName=\"$STG_DB_NAME\" --file=\"/tmp/${PROD_DB_NAME}.sql.gz\" && \
+                rm -f \"/tmp/${PROD_DB_NAME}.sql.gz\""
+
+        execute_with_spinner "Migrating Database ($PROD_DB_NAME -> $STG_DB_NAME)..." "$DB_CMD"
+    else
+        echo -e "\e[34m[i]\e[0m No production database found. Skipping DB migration."
+    fi
+
+    DEST_DIR="/home/$STG_USER/htdocs/$STG_DOMAIN"
+
+    FILE_ESTIMATE=$(get_size_estimate "$SRC_DIR")
+    echo -e "\e[34m[i]\e[0m File Volume: $FILE_ESTIMATE"
+
+    FILE_CMD="tar -C \"$SRC_DIR\" -cf - . | tar -xf - -C \"$DEST_DIR\" && chown -R \"$STG_USER:$STG_USER\" \"$DEST_DIR\""
+
+    execute_with_spinner "Copying Site Files and Setting Permissions..." "$FILE_CMD"
+
+    echo -e "\e[32m[✓]\e[0m Updating environment config files..."
+    if [[ -n "$PROD_DB_NAME" ]]; then
+        if [[ -f "$DEST_DIR/wp-config.php" ]]; then
+            sed -i "s/define( *'DB_NAME', *'[^']*' *);/define('DB_NAME', '$STG_DB_NAME');/g" "$DEST_DIR/wp-config.php"
+            sed -i "s/define( *'DB_USER', *'[^']*' *);/define('DB_USER', '$STG_DB_USER');/g" "$DEST_DIR/wp-config.php"
+            sed -i "s/define( *'DB_PASSWORD', *'[^']*' *);/define('DB_PASSWORD', '$STG_DB_PASS');/g" "$DEST_DIR/wp-config.php"
+
+            if grep -q "WP_HOME" "$DEST_DIR/wp-config.php"; then
+                sed -i "s|define( *'WP_HOME', *'[^']*' *);|define('WP_HOME', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
+                sed -i "s|define( *'WP_SITEURL', *'[^']*' *);|define('WP_SITEURL', 'https://$STG_DOMAIN');|g" "$DEST_DIR/wp-config.php"
+            else
+                sed -i "/define( *'DB_PASSWORD'/a define('WP_HOME', 'https://$STG_DOMAIN');\ndefine('WP_SITEURL', 'https://$STG_DOMAIN');" "$DEST_DIR/wp-config.php"
+            fi
+
+            if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
+                sed -i "s/define( *'DOMAIN_CURRENT_SITE', *'[^']*' *);/define('DOMAIN_CURRENT_SITE', '$STG_DOMAIN');/g" "$DEST_DIR/wp-config.php"
+                execute_with_spinner "Multisite Detected: Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"$PROD_DOMAIN\" \"$STG_DOMAIN\" --network --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
+            else
+                execute_with_spinner "Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"https://$PROD_DOMAIN\" \"https://$STG_DOMAIN\" --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
+            fi
+        elif [[ -f "$DEST_DIR/.env" ]]; then
+            sed -i "s/DB_DATABASE=.*/DB_DATABASE=$STG_DB_NAME/g" "$DEST_DIR/.env"
+            sed -i "s/DB_USERNAME=.*/DB_USERNAME=$STG_DB_USER/g" "$DEST_DIR/.env"
+            sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=$STG_DB_PASS/g" "$DEST_DIR/.env"
+        fi
+    fi
+
+    PROD_VARNISH="/home/$SRC_USER/.varnish-cache/settings.json"
+    STG_VARNISH_DIR="/home/$STG_USER/.varnish-cache"
+
+    if [[ -f "$PROD_VARNISH" ]]; then
+        echo -e "\e[32m[✓]\e[0m Cloning Varnish Cache configuration..."
+        mkdir -p "$STG_VARNISH_DIR"
+        sed "s/$PROD_DOMAIN/$STG_DOMAIN/g" "$PROD_VARNISH" > "$STG_VARNISH_DIR/settings.json"
+        chown -R "$STG_USER:$STG_USER" "$STG_VARNISH_DIR"
+    fi
+
+    PROD_VHOST="/etc/nginx/sites-enabled/$PROD_DOMAIN.conf"
+    STG_VHOST="/etc/nginx/sites-enabled/$STG_DOMAIN.conf"
+    [[ ! -f "$PROD_VHOST" ]] && PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf" && STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
+
+    if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
+        STG_PORT=$(grep "fastcgi_pass" "$STG_VHOST" | awk '{print $2}' | tr -d ';')
+
+        sed -e "s|/home/$SRC_USER/|/home/$STG_USER/|g" \
+            -e "s|-$SRC_USER\.sock|-$STG_USER.sock|g" \
+            -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" \
+            "$PROD_VHOST" > "$STG_VHOST"
+
+        if [[ -n "$STG_PORT" ]]; then
+            sed -i "s/fastcgi_pass.*/fastcgi_pass $STG_PORT;/g" "$STG_VHOST"
         fi
 
-                if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php"; then
-            sed -i "s/define( *'DOMAIN_CURRENT_SITE', *'[^']*' *);/define('DOMAIN_CURRENT_SITE', '$STG_DOMAIN');/g" "$DEST_DIR/wp-config.php"
-            execute_with_spinner "Multisite Detected: Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"$PROD_DOMAIN\" \"$STG_DOMAIN\" --network --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx
+            echo -e "\e[32m[✓]\e[0m Custom Nginx vHost settings copied successfully."
         else
-            execute_with_spinner "Running deep WP-CLI search-replace..." "sudo -u \"$STG_USER\" wp search-replace \"https://$PROD_DOMAIN\" \"https://$STG_DOMAIN\" --skip-plugins --skip-themes --path=\"$DEST_DIR\"" "true"
+            clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS" >/dev/null 2>&1 || true
+            systemctl reload nginx
+            echo -e "\e[33m[!]\e[0m Copied vHost failed Nginx tests. Reverted to default template safely."
         fi
-    elif [[ -f "$DEST_DIR/.env" ]]; then
-        sed -i "s/DB_DATABASE=.*/DB_DATABASE=$STG_DB_NAME/g" "$DEST_DIR/.env"
-        sed -i "s/DB_USERNAME=.*/DB_USERNAME=$STG_DB_USER/g" "$DEST_DIR/.env"
-        sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=$STG_DB_PASS/g" "$DEST_DIR/.env"
-    fi
-fi
-
-# ==========================================
-# 7.5 Clone Varnish Cache Settings
-# ==========================================
-PROD_VARNISH="/home/$SRC_USER/.varnish-cache/settings.json"
-STG_VARNISH_DIR="/home/$STG_USER/.varnish-cache"
-
-if [[ -f "$PROD_VARNISH" ]]; then
-    echo -e "\e[32m[✓]\e[0m Cloning Varnish Cache configuration..."
-    mkdir -p "$STG_VARNISH_DIR"
-    
-    # Copy the settings file and replace any instances of the production domain
-    sed "s/$PROD_DOMAIN/$STG_DOMAIN/g" "$PROD_VARNISH" > "$STG_VARNISH_DIR/settings.json"
-    
-    # Ensure the new staging user owns the copied Varnish config
-    chown -R "$STG_USER:$STG_USER" "$STG_VARNISH_DIR"
-fi
-
-# ==========================================
-# 8. Clone Custom vHost Edits (Safe Fallback)
-# ==========================================
-PROD_VHOST="/etc/nginx/sites-enabled/$PROD_DOMAIN.conf"
-STG_VHOST="/etc/nginx/sites-enabled/$STG_DOMAIN.conf"
-[[ ! -f "$PROD_VHOST" ]] && PROD_VHOST="/etc/nginx/sites-available/$PROD_DOMAIN.conf" && STG_VHOST="/etc/nginx/sites-available/$STG_DOMAIN.conf"
-
-if [[ -f "$PROD_VHOST" && -f "$STG_VHOST" ]]; then
-    # Extract the newly generated PHP port for the staging site
-    STG_PORT=$(grep "fastcgi_pass" "$STG_VHOST" | awk '{print $2}' | tr -d ';')
-
-    # Clone the custom vHost edits AND strictly fix paths safely
-    sed -e "s|/home/$SRC_USER/|/home/$STG_USER/|g" \
-        -e "s|-$SRC_USER\.sock|-$STG_USER.sock|g" \
-        -e "s/$PROD_DOMAIN/$STG_DOMAIN/g" \
-        "$PROD_VHOST" > "$STG_VHOST"
-    
-    # Inject the correct staging PHP port back into the cloned vHost
-    if [[ -n "$STG_PORT" ]]; then
-        sed -i "s/fastcgi_pass.*/fastcgi_pass $STG_PORT;/g" "$STG_VHOST"
     fi
 
-    if nginx -t >/dev/null 2>&1; then
-        systemctl reload nginx
-        echo -e "\e[32m[✓]\e[0m Custom Nginx vHost settings copied successfully."
+    SAN_LIST=""
+    DISPLAY_DOMAINS="$STG_DOMAIN"
+
+    if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php" 2>/dev/null; then
+        DB_PREFIX=$(grep -E "^\s*\\\$table_prefix\s*=" "$DEST_DIR/wp-config.php" | awk -F"['\"]" '{print $2}' | head -n1)
+        [[ -z "$DB_PREFIX" ]] && DB_PREFIX="wp_"
+
+        SUBS=$(sudo -u "$STG_USER" wp db query "SELECT domain FROM ${DB_PREFIX}blogs;" --skip-column-names --path="$DEST_DIR" 2>/dev/null | tr -d '\r' | grep -v "^$STG_DOMAIN$" || true)
+
+        if [[ -n "$SUBS" ]]; then
+            SAN_LIST=$(echo "$SUBS" | sed '/^[[:space:]]*$/d' | paste -sd "," -)
+            DISPLAY_DOMAINS="$STG_DOMAIN, $(echo "$SUBS" | sed '/^[[:space:]]*$/d' | paste -sd ", " -)"
+        fi
+    fi
+
+    echo -e "\n----------------------------------------------------------------------"
+    echo -e "⚠️  \e[33mDNS VERIFICATION REQUIRED FOR SSL\e[0m"
+    echo -e "To successfully issue Let's Encrypt certificates, the following"
+    echo -e "domain(s) MUST be pointed to this server's IP address:"
+    echo -e "\n   \e[36m$DISPLAY_DOMAINS\e[0m\n"
+    echo -e "If you use Cloudflare, ensure the proxy status is temporarily 'DNS Only'."
+    echo -e "----------------------------------------------------------------------"
+
+    trap - EXIT INT TERM
+
+    read -p "Have you pointed the DNS records and want to issue the SSL? (y/n): " ISSUE_SSL
+
+    if [[ "$ISSUE_SSL" =~ ^[Yy]$ ]]; then
+        trap cleanup_on_error EXIT INT TERM
+        if [[ -n "$SAN_LIST" ]]; then
+            execute_with_spinner "Issuing SAN SSL Certificate..." "clpctl lets-encrypt:install:certificate --domainName=\"$STG_DOMAIN\" --subjectAlternativeName=\"$SAN_LIST\"" "true"
+        else
+            execute_with_spinner "Issuing Standard SSL Certificate..." "clpctl lets-encrypt:install:certificate --domainName=\"$STG_DOMAIN\"" "true"
+        fi
     else
-        clpctl site:add:php --domainName="$STG_DOMAIN" --phpVersion="$PHP_VERSION" --vhostTemplate="Generic" --siteUser="$STG_USER" --siteUserPassword="$STG_PASS" >/dev/null 2>&1 || true
-        systemctl reload nginx
-        echo -e "\e[33m[!]\e[0m Copied vHost failed Nginx tests. Reverted to default template safely."
+        echo -e "\n[i] Skipping SSL certificate issuance. You can do this later via CloudPanel."
     fi
-fi
+
+    trap - EXIT INT TERM
+
+    echo -e "\n========================================================"
+    echo -e "✅ \e[32mStaging Deployment Complete!\e[0m"
+    echo "Staging Domain:  $STG_DOMAIN"
+    echo "SSH/SFTP User:   $STG_USER"
+    echo "SSH/SFTP Pass:   $STG_PASS"
+    if [[ -n "$PROD_DB_NAME" ]]; then
+        echo "Database Name:   $STG_DB_NAME"
+        echo "Database User:   $STG_DB_USER"
+        echo "Database Pass:   $STG_DB_PASS"
+        if [[ -f "$DEST_DIR/wp-config.php" ]]; then
+            echo -e "\n=> WP Admin Login: Use the SAME username and password as your live site!"
+        fi
+    fi
+    echo "========================================================"
+}
 
 # ==========================================
-# 9. Multisite DNS Check & SSL Issuance
+# Main entry
 # ==========================================
-SAN_LIST=""
-DISPLAY_DOMAINS="$STG_DOMAIN"
+build_site_lists
 
-if grep -q "DOMAIN_CURRENT_SITE" "$DEST_DIR/wp-config.php" 2>/dev/null; then
-    DB_PREFIX=$(grep -E "^\s*\\\$table_prefix\s*=" "$DEST_DIR/wp-config.php" | awk -F"['\"]" '{print $2}' | head -n1)
-    [[ -z "$DB_PREFIX" ]] && DB_PREFIX="wp_"
+choose_site "CloudPanel Staging Manager — select an action (filter, arrows, Enter):" MAIN_ACTION \
+    "$ACTION_CREATE" "$ACTION_REMOVE" "$ACTION_REFRESH"
 
-    SUBS=$(sudo -u "$STG_USER" wp db query "SELECT domain FROM ${DB_PREFIX}blogs;" --skip-column-names --path="$DEST_DIR" 2>/dev/null | tr -d '\r' | grep -v "^$STG_DOMAIN$" || true)
-    
-    if [[ -n "$SUBS" ]]; then
-        SAN_LIST=$(echo "$SUBS" | sed '/^[[:space:]]*$/d' | paste -sd "," -)
-        DISPLAY_DOMAINS="$STG_DOMAIN, $(echo "$SUBS" | sed '/^[[:space:]]*$/d' | paste -sd ", " -)"
-    fi
+if [[ -z "$MAIN_ACTION" ]]; then
+    echo -e "\e[31m[ERROR] No action selected. Aborting.\e[0m"
+    exit 1
 fi
 
-echo -e "\n----------------------------------------------------------------------"
-echo -e "⚠️  \e[33mDNS VERIFICATION REQUIRED FOR SSL\e[0m"
-echo -e "To successfully issue Let's Encrypt certificates, the following"
-echo -e "domain(s) MUST be pointed to this server's IP address:"
-echo -e "\n   \e[36m$DISPLAY_DOMAINS\e[0m\n"
-echo -e "If you use Cloudflare, ensure the proxy status is temporarily 'DNS Only'."
-echo -e "----------------------------------------------------------------------"
-
-trap - EXIT INT TERM 
-
-read -p "Have you pointed the DNS records and want to issue the SSL? (y/n): " ISSUE_SSL
-
-if [[ "$ISSUE_SSL" =~ ^[Yy]$ ]]; then
-    trap cleanup_on_error EXIT INT TERM
-    if [[ -n "$SAN_LIST" ]]; then
-        execute_with_spinner "Issuing SAN SSL Certificate..." "clpctl lets-encrypt:install:certificate --domainName=\"$STG_DOMAIN\" --subjectAlternativeName=\"$SAN_LIST\"" "true"
-    else
-        execute_with_spinner "Issuing Standard SSL Certificate..." "clpctl lets-encrypt:install:certificate --domainName=\"$STG_DOMAIN\"" "true"
-    fi
-else
-    echo -e "\n[i] Skipping SSL certificate issuance. You can do this later via CloudPanel."
-fi
-
-trap - EXIT INT TERM 
-
-echo -e "\n========================================================"
-echo -e "✅ \e[32mStaging Deployment Complete!\e[0m"
-echo "Staging Domain:  $STG_DOMAIN"
-echo "SSH/SFTP User:   $STG_USER"
-echo "SSH/SFTP Pass:   $STG_PASS"
-if [[ -n "$PROD_DB_NAME" ]]; then
-echo "Database Name:   $STG_DB_NAME"
-echo "Database User:   $STG_DB_USER"
-echo "Database Pass:   $STG_DB_PASS"
-if [[ -f "$DEST_DIR/wp-config.php" ]]; then
-echo -e "\n=> WP Admin Login: Use the SAME username and password as your live site!"
-fi
-fi
-echo "========================================================"
+case "$MAIN_ACTION" in
+    "$ACTION_CREATE")
+        run_create_from_live
+        ;;
+    "$ACTION_REMOVE")
+        run_remove_staging
+        ;;
+    "$ACTION_REFRESH")
+        run_refresh_staging
+        ;;
+    *)
+        echo -e "\e[31m[ERROR] Unknown action. Aborting.\e[0m"
+        exit 1
+        ;;
+esac
