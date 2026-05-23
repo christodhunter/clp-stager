@@ -56,6 +56,42 @@ get_db_estimate() {
 }
 
 # ==========================================
+# CLOUDPANEL-STYLE NAMING (from domain)
+# ==========================================
+cloudpanel_name_from_domain() {
+    local domain="$1"
+    local max_len="${2:-32}"
+    echo "$domain" | tr '[:upper:]' '[:lower:]' | sed 's/^www\.//' | sed 's/[^a-z0-9]//g' | cut -c1-"$max_len"
+}
+
+ensure_staging_names_available() {
+    local domain="$1"
+    local site_user="$2"
+    local db_name="$3"
+    local existing
+
+    existing=$(sqlite3 "$DB_PATH" "SELECT domain_name FROM site WHERE domain_name = '$domain' LIMIT 1;" | tr -d '\r\n')
+    if [[ -n "$existing" ]]; then
+        echo -e "\e[31m[ERROR] A site for $domain already exists. Aborting.\e[0m"
+        exit 1
+    fi
+
+    existing=$(sqlite3 "$DB_PATH" "SELECT domain_name FROM site WHERE user = '$site_user' LIMIT 1;" | tr -d '\r\n')
+    if [[ -n "$existing" ]]; then
+        echo -e "\e[31m[ERROR] Site user '$site_user' is already used by $existing. Choose a different staging domain.\e[0m"
+        exit 1
+    fi
+
+    if [[ -n "$db_name" ]]; then
+        existing=$(sqlite3 "$DB_PATH" "SELECT name FROM database WHERE name = '$db_name' LIMIT 1;" | tr -d '\r\n')
+        if [[ -n "$existing" ]]; then
+            echo -e "\e[31m[ERROR] Database name '$db_name' already exists. Choose a different staging domain.\e[0m"
+            exit 1
+        fi
+    fi
+}
+
+# ==========================================
 # AUTO-CLEANUP (ROLLBACK) ON ERROR
 # ==========================================
 STG_DOMAIN_CREATED=false
@@ -539,11 +575,22 @@ run_create_from_live() {
         echo -e "  \e[90m↳ Auto-completed to: $STG_DOMAIN\e[0m"
     fi
 
-    CLEAN_DOMAIN=$(echo "$STG_DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-6)
-    RND_STR=$(openssl rand -hex 2)
-    STG_USER="stg${CLEAN_DOMAIN}${RND_STR}"
+    STG_USER=$(cloudpanel_name_from_domain "$STG_DOMAIN" 32)
+    if [[ -z "$STG_USER" ]]; then
+        echo -e "\e[31m[ERROR] Could not derive a valid site user from '$STG_DOMAIN'.\e[0m"
+        exit 1
+    fi
     STG_PASS="Stg1!$(openssl rand -hex 6)"
 
+    if [[ -n "$PROD_DB_NAME" ]]; then
+        STG_DB_NAME="$STG_USER"
+        STG_DB_USER="$STG_USER"
+        STG_DB_PASS=$(openssl rand -hex 16)
+    fi
+
+    ensure_staging_names_available "$STG_DOMAIN" "$STG_USER" "${STG_DB_NAME:-}"
+
+    echo -e "\e[34m[i]\e[0m Site user: \e[32m$STG_USER\e[0m (derived from $STG_DOMAIN, CloudPanel-style)"
     echo ""
 
     CMD="clpctl site:add:php --domainName=\"$STG_DOMAIN\" --phpVersion=\"$PHP_VERSION\" --vhostTemplate=\"Generic\" --siteUser=\"$STG_USER\" --siteUserPassword=\"$STG_PASS\""
@@ -551,9 +598,6 @@ run_create_from_live() {
     STG_DOMAIN_CREATED=true
 
     if [[ -n "$PROD_DB_NAME" ]]; then
-        STG_DB_NAME="db${CLEAN_DOMAIN}${RND_STR}"
-        STG_DB_USER="u${CLEAN_DOMAIN}${RND_STR}"
-        STG_DB_PASS=$(openssl rand -hex 16)
         STG_DB_CREATED=true
 
         DB_ESTIMATE=$(get_db_estimate "$PROD_DB_NAME")
