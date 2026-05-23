@@ -45,13 +45,23 @@ On **create** and **refresh** (`.env` is patched in place; never overwritten who
 | `QUEUE_CONNECTION` | `sync` (create always; refresh only if key already exists) |
 | `SESSION_DOMAIN` / `SANCTUM_STATEFUL_DOMAINS` | Updated only if already present in `.env` |
 
-After env updates, runs `php artisan optimize:clear` as the site user (non-fatal if it fails).
+After env updates, runs the following Artisan commands as the site user (all non-fatal):
+
+| Command | Purpose |
+|---------|---------|
+| `config:clear` | Clears compiled config cache |
+| `cache:clear` | Clears application cache |
+| `route:clear` | Clears route cache |
+| `view:clear` | Clears compiled view cache |
+| `config:cache` | Recaches config for performance |
+| `storage:link` | Ensures `public/storage` symlink exists |
+| `queue:restart` | Signals workers to restart after next job |
 
 `APP_KEY` is copied from live on create and **not** changed on refresh.
 
 **Laravel DB URLs:** Unlike WordPress, the script does not run a generic database URL search-replace (risk of corrupting serialized data). Most Laravel apps resolve URLs from `.env`; if your app stores absolute URLs in the database, review those tables manually after refresh.
 
-**Not automated:** `composer install`, `php artisan migrate`, `storage:link`, or third-party API keys in `.env` (Stripe, S3, etc.) — review after the first staging create.
+**Not automated:** `composer install`, `php artisan migrate`, or third-party API keys in `.env` (Stripe, S3, etc.) — review after the first staging create.
 
 ### Refresh from live
 
@@ -61,7 +71,7 @@ After env updates, runs `php artisan optimize:clear` as the site user (non-fatal
 - Type `yes` to confirm overwrite.
 - Replaces staging DB and files; **preserves** root `wp-config.php` and `.env`, then re-applies staging-specific settings (WordPress `WP_ENV` / Laravel `APP_*` / `DB_*`).
 - WordPress: WP-CLI `search-replace` for live → staging URLs.
-- Laravel: `.env` staging keys + `artisan optimize:clear`.
+- Laravel: `.env` staging keys + Artisan cache/config/view clear + storage:link.
 
 ### Create new staging site
 
@@ -290,6 +300,31 @@ patch_env_key() {
     fi
 }
 
+ensure_laravel_env_file() {
+    local dest_dir="$1"
+    local env_file="$dest_dir/.env"
+    [[ -f "$env_file" ]] && return 0
+    if [[ -f "$dest_dir/.env.example" ]]; then
+        cp "$dest_dir/.env.example" "$env_file"
+        echo -e "\e[33m[!]\e[0m .env missing — bootstrapped from .env.example."
+        return 0
+    fi
+    echo -e "\e[33m[!]\e[0m Laravel .env and .env.example both missing in $dest_dir. Skipping env updates."
+    return 1
+}
+
+warn_production_like_laravel_env() {
+    local env_file="$1"
+    [[ -f "$env_file" ]] || return 0
+    local app_env mailer queue
+    app_env=$(read_env_key "$env_file" "APP_ENV")
+    mailer=$(read_env_key "$env_file" "MAIL_MAILER")
+    queue=$(read_env_key "$env_file" "QUEUE_CONNECTION")
+    if [[ "$app_env" == "production" || "$mailer" == "smtp" || "$queue" == "redis" || "$queue" == "sqs" ]]; then
+        echo -e "\e[33m[!]\e[0m Production-like env detected (APP_ENV=$app_env / MAIL=$mailer / QUEUE=$queue). Applying staging-safe defaults."
+    fi
+}
+
 dedupe_wp_config_define() {
     local file="$1"
     local const="$2"
@@ -417,11 +452,17 @@ run_laravel_post_deploy() {
 
     [[ -f "$dest_dir/artisan" ]] || return 0
     if ! command -v php &>/dev/null; then
-        echo -e "\e[33m[!]\e[0m php not found. Skipping artisan optimize:clear."
+        echo -e "\e[33m[!]\e[0m php not found. Skipping Artisan post-deploy commands."
         return 0
     fi
 
-    execute_with_spinner "Clearing Laravel caches (optimize:clear)..." "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan optimize:clear" "true"
+    execute_with_spinner "Laravel: config:clear..."  "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan config:clear" "true"
+    execute_with_spinner "Laravel: cache:clear..."   "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan cache:clear" "true"
+    execute_with_spinner "Laravel: route:clear..."   "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan route:clear" "true"
+    execute_with_spinner "Laravel: view:clear..."    "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan view:clear" "true"
+    execute_with_spinner "Laravel: config:cache..."  "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan config:cache" "true"
+    execute_with_spinner "Laravel: storage:link..."  "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan storage:link" "true"
+    execute_with_spinner "Laravel: queue:restart..." "cd \"$dest_dir\" && sudo -u \"$site_user\" php artisan queue:restart" "true"
 }
 
 apply_staging_environment() {
@@ -449,7 +490,7 @@ apply_staging_environment() {
             fi
             ;;
         laravel)
-            if [[ -f "$dest_dir/.env" ]]; then
+            if ensure_laravel_env_file "$dest_dir"; then
                 if [[ "$mode" == "refresh" ]]; then
                     env_db_name=$(read_env_key "$dest_dir/.env" "DB_DATABASE")
                     env_db_user=$(read_env_key "$dest_dir/.env" "DB_USERNAME")
@@ -459,7 +500,9 @@ apply_staging_environment() {
                     [[ -n "$env_db_pass" ]] && stg_db_pass="$env_db_pass"
                 fi
                 if [[ -n "$stg_db_name" && -n "$stg_db_user" && -n "$stg_db_pass" ]]; then
+                    warn_production_like_laravel_env "$dest_dir/.env"
                     apply_laravel_staging_env "$dest_dir" "$staging_url" "$stg_db_name" "$stg_db_user" "$stg_db_pass" "$mode"
+                    chown "$stg_user:$stg_user" "$dest_dir/.env"
                     run_laravel_post_deploy "$dest_dir" "$stg_user"
                 else
                     echo -e "\e[33m[!]\e[0m Laravel .env found but database credentials could not be resolved. Skipping .env updates."
